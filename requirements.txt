@@ -1,3 +1,5 @@
+Gunicorn
+Flask
 numpy>=2.3.4
 pandas>=2.2.3
 curl-cffi>=0.11.4
@@ -5,7 +7,7 @@ lxml>=6.0.2
 scipy>=1.16.2
 TA-Lib>=0.6.8
 pyecharts==1.9.1
-Flask>=2.3.3
+
 
 # Optional: only needed when using FinLab token (app.py only, not app_no_finlab.py)
 # finlab>=1.5.0

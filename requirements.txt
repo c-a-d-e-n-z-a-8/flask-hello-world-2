@@ -2,7 +2,7 @@ Gunicorn
 Flask
 numpy>=2.3.4
 pandas>=2.2.3
-curl-cffi>=0.11.4
+curl-cffi==0.15.0
 lxml>=6.0.2
 scipy>=1.16.2
 pyecharts==1.9.1

@@ -2728,12 +2728,4 @@ def _render_result(ticker: str, days: int, chart_url: str, chart_err: str, repor
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='YfinanceQuery Flask UI')
-    parser.add_argument('--host', default='127.0.0.1', help='Bind address (default: 127.0.0.1)')
-    parser.add_argument('--port', type=int, default=5000, help='Port (default: 5000)')
-    parser.add_argument('--debug', action='store_true', help='Enable Flask debug mode')
-    args = parser.parse_args()
-
-    print(f'Starting server at http://{args.host}:{args.port}')
-    print(f'Chart files will be stored in: {WORK_DIR}')
-    app.run(host=args.host, port=args.port, debug=args.debug)
+  app.run(debug=True)

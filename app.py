@@ -1922,7 +1922,7 @@ def report_get_finviz_overview(token):
 
   url = 'https://finviz.com/quote.ashx?t=' + token
   headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36'}
-  r = requests.get(url, headers=headers, verify=False, timeout=10)
+  r = requests.get(url, headers=headers, verify=False, impersonate="chrome", timeout=10)
   r.encoding = 'utf-8'
 
   # https://www.quotemedia.com/quotetools/symbolHelp/SymbolHelp_US_Version_Default.html?fbclid=IwAR0yadiPkg-Mp4X-guCwFYH7oJLnO2TvXgGy1a_sn-_idcAxNpycNiLsLOE
@@ -1981,7 +1981,7 @@ def report_get_fbs_position_overview(token):
     stats = ''
 
     # Handle overview
-    r = requests.get(url_overview, headers=headers, verify=False, timeout=5)
+    r = requests.get(url_overview, headers=headers, verify=False, impersonate="chrome", timeout=5)
     r.encoding = 'big5'
     if r.status_code == 200:
 
@@ -2017,7 +2017,7 @@ def report_get_fbs_position_overview(token):
       
     
     # Handle major investors
-    r = requests.get(url_major, headers=headers, verify=False, timeout=5)
+    r = requests.get(url_major, headers=headers, verify=False, impersonate="chrome", timeout=5)
     r.encoding = 'big5'
     if r.status_code == 200:
 
@@ -2050,7 +2050,7 @@ def report_get_fbs_position_overview(token):
 
 
     # Handle 3 institutes
-    r = requests.get(url_inst, headers=headers, timeout=5)
+    r = requests.get(url_inst, headers=headers, impersonate="chrome", timeout=5)
     r.encoding = 'big5'
     if r.status_code == 200:
       selector = etree.HTML(r.text)
@@ -2071,7 +2071,7 @@ def report_get_fbs_position_overview(token):
       
       
     # Handle stock news
-    r = requests.get(url_news, headers=headers, timeout=5, verify=False)
+    r = requests.get(url_news, headers=headers, timeout=5, impersonate="chrome", verify=False)
     r.encoding = 'big5'
     if r.status_code == 200:
       selector = etree.HTML(r.text)
@@ -2137,7 +2137,7 @@ def report_get_position_pyramid(token):
     print_time_delta_start = time()
     params = {'stock': token[0:token.index('.TW')]}
 
-    r = requests.get('https://norway.twsthr.info/StockHolders.aspx', params=params, headers=headers, verify=False, timeout=5)
+    r = requests.get('https://norway.twsthr.info/StockHolders.aspx', params=params, headers=headers, verify=False, impersonate="chrome", timeout=5)
     #print(r.text)
 
     if r.status_code == 200:

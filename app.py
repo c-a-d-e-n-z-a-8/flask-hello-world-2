@@ -596,6 +596,566 @@ def _critical_points_after(stock_df, stock_df_w):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# AR(2) Regime Detection (ported from TradingView/regime.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+AR_WINDOWS = [50, 100, 200, 500]
+MOD_PCT_THRESHOLD = 0.003
+CONFIDENCE_BANDWIDTH = 0.04
+FORWARD_BARS = [5, 10, 20]
+OSC_DIVERGENT = 1.03
+OSC_SUSTAINED = 0.97
+TREND_EXPLOSIVE = 1.03
+TREND_HEALTHY = 0.95
+
+REGIME_DISPLAY = {
+    'divergent_osc': '\U0001f4a5 發散震盪',
+    'sustained_osc': '\U0001f504 持續震盪',
+    'convergent_osc': '\U0001f3af 收斂震盪',
+    'explosive_trend': '⚡ 爆發趨勢',
+    'healthy_trend': '✅ 健康趨勢',
+    'mean_reversion': '↩ 均值回歸',
+    'insufficient': '⛔ 資料不足',
+}
+
+REGIME_COLORS = {
+    'divergent_osc': '#FF0000',
+    'sustained_osc': '#00CED1',
+    'convergent_osc': '#FFD700',
+    'explosive_trend': '#FF8C00',
+    'healthy_trend': '#00FF7F',
+    'mean_reversion': '#808080',
+    'insufficient': '#404040',
+}
+
+REGIME_SUB_DISPLAY = {
+    'divergent_osc_rising':  ('\U0001f4a5 發散震盪(加速)', '立即清倉，遠離市場'),
+    'divergent_osc_flat':    ('\U0001f4a5 發散震盪(僵持)', '空手觀望，勿輕舉妄動'),
+    'divergent_osc_falling': ('\U0001f4a5 發散震盪(趨緩)', '繼續觀望，等待穿越1.03'),
+    'sustained_osc_rising':  ('\U0001f504 持續震盪(轉熱)', '縮小倉位，警戒突破方向'),
+    'sustained_osc_flat':    ('\U0001f504 持續震盪(標準)', '標準區間高拋低吸'),
+    'sustained_osc_falling': ('\U0001f504 持續震盪(轉冷)', '縮停損，等待收斂突破'),
+    'convergent_osc_rising_up':      ('\U0001f3af 收斂震盪(蓄力峰) ▲偏多', '突破在即，備好多單條件單'),
+    'convergent_osc_rising_dn':      ('\U0001f3af 收斂震盪(蓄力峰) ▼偏空', '突破在即，備好空單條件單'),
+    'convergent_osc_rising_unclear': ('\U0001f3af 收斂震盪(蓄力峰) ❓方向未定', '突破在即，等方向確認'),
+    'convergent_osc_flat_up':        ('\U0001f3af 收斂震盪(持續壓縮) ▲偏多', '持續壓縮，等待放量向上突破'),
+    'convergent_osc_flat_dn':        ('\U0001f3af 收斂震盪(持續壓縮) ▼偏空', '持續壓縮，等待放量向下突破'),
+    'convergent_osc_flat_unclear':   ('\U0001f3af 收斂震盪(持續壓縮) ❓方向未定', '持續壓縮，等待放量突破'),
+    'convergent_osc_falling_up':     ('\U0001f3af 收斂震盪(急速收斂) ▲偏多', '突破窗口縮短，備好多單'),
+    'convergent_osc_falling_dn':     ('\U0001f3af 收斂震盪(急速收斂) ▼偏空', '突破窗口縮短，備好空單'),
+    'convergent_osc_falling_unclear':('\U0001f3af 收斂震盪(急速收斂) ❓方向未定', '突破窗口縮短，提高警覺'),
+    'explosive_trend_rising':  ('⚡ 爆發趨勢(加速)', '持倉勿動，移動停損跟緊'),
+    'explosive_trend_flat':    ('⚡ 爆發趨勢(巡航)', '持倉，移動停損正常跟隨'),
+    'explosive_trend_falling': ('⚡ 爆發趨勢(降溫)', '開始減倉1/3，上移停損'),
+    'healthy_trend_rising':    ('✅ 健康趨勢(加速)', '可加碼，停損移至成本'),
+    'healthy_trend_flat':      ('✅ 健康趨勢(標準)', '重倉順勢，回調加碼'),
+    'healthy_trend_falling':   ('✅ 健康趨勢(鬆動)', '減倉至半倉，停損收緊'),
+    'mean_reversion_breakout_up':     ('⭐▲ 蓄力向上突破', '積極布局多單'),
+    'mean_reversion_breakout_dn':     ('⭐▼ 蓄力向下突破', '積極布局空單'),
+    'mean_reversion_unclear':         ('⭐❓ 蓄力方向未定', '觀望等均線方向確認'),
+    'mean_reversion_flat':            ('⏸ 低位盤整盤', '觀望，等模數方向確認'),
+    'mean_reversion_exhaustion_bear': ('\U0001f480▼ 空方動能衰竭', '逆勢輕倉或空手'),
+    'mean_reversion_exhaustion_bull': ('\U0001f480▲ 多方動能衰竭', '逆勢輕倉或空手'),
+    'mean_reversion_decay':           ('↩ 動能衰竭盤', '逆勢輕倉或空手'),
+    'insufficient':                   ('⛔ 資料不足', '禁止交易'),
+}
+
+REGIME_STRENGTH = {
+    'explosive_trend_rising': 1.0, 'explosive_trend_flat': 0.8, 'explosive_trend_falling': 0.4,
+    'healthy_trend_rising': 0.9, 'healthy_trend_flat': 0.7, 'healthy_trend_falling': 0.3,
+    'mean_reversion_breakout_up': 0.8, 'mean_reversion_breakout_dn': 0.8,
+    'mean_reversion_unclear': 0.0, 'mean_reversion_flat': 0.0,
+    'mean_reversion_exhaustion_bear': 0.5, 'mean_reversion_exhaustion_bull': 0.5,
+    'mean_reversion_decay': 0.0,
+    'convergent_osc_rising_up': 0.6, 'convergent_osc_rising_dn': 0.6, 'convergent_osc_rising_unclear': 0.0,
+    'convergent_osc_flat_up': 0.3, 'convergent_osc_flat_dn': 0.3, 'convergent_osc_flat_unclear': 0.0,
+    'convergent_osc_falling_up': 0.2, 'convergent_osc_falling_dn': 0.2, 'convergent_osc_falling_unclear': 0.0,
+    'sustained_osc_rising': 0.0, 'sustained_osc_flat': 0.0, 'sustained_osc_falling': 0.0,
+    'divergent_osc_rising': 0.0, 'divergent_osc_flat': 0.0, 'divergent_osc_falling': 0.0,
+    'insufficient': 0.0,
+}
+
+
+def regime_kalman_filter(close, R=10.0, Q1=0.01, Q2=0.01):
+    n = len(close)
+    kf_x = np.full(n, np.nan)
+    kf_v = np.full(n, np.nan)
+    x, vel = close[0], 0.0
+    p11, p12, p21, p22 = 1.0, 0.0, 0.0, 1.0
+    kf_x[0], kf_v[0] = x, vel
+    for i in range(1, n):
+        if np.isnan(close[i]):
+            kf_x[i], kf_v[i] = x, vel
+            continue
+        x_p = x + vel
+        v_p = vel
+        p11_p = p11 + p12 + p21 + p22 + Q1
+        p12_p = p12 + p22
+        p21_p = p21 + p22
+        p22_p = p22 + Q2
+        y = close[i] - x_p
+        S = max(p11_p + R, 1e-10)
+        K1, K2 = p11_p / S, p21_p / S
+        x = x_p + K1 * y
+        vel = v_p + K2 * y
+        IK1 = 1.0 - K1
+        p11 = max(IK1 * IK1 * p11_p + K1 * K1 * R, 1e-9)
+        p12 = IK1 * (p12_p - K2 * p11_p) + K1 * K2 * R
+        p21 = p12
+        p22 = max(K2 * K2 * p11_p - K2 * p21_p - K2 * p12_p + p22_p + K2 * K2 * R, 1e-9)
+        kf_x[i], kf_v[i] = x, vel
+    return kf_x, kf_v
+
+
+def regime_ar2_fit(log_returns, window):
+    r = log_returns.fillna(0.0)
+    r1 = r.shift(1).fillna(0.0)
+    r2 = r.shift(2).fillna(0.0)
+    s11 = (r1 * r1).rolling(window).sum()
+    s12 = (r1 * r2).rolling(window).sum()
+    s22 = (r2 * r2).rolling(window).sum()
+    s10 = (r1 * r).rolling(window).sum()
+    s20 = (r2 * r).rolling(window).sum()
+    det = s11 * s22 - s12 ** 2
+    trace = s11 + s22
+    cond = trace / (det.abs() + 1e-15)
+    stable = (det.abs() > 1e-12) & (cond < 1e8)
+    result = pd.DataFrame(index=log_returns.index)
+    result['a1'] = np.where(stable, (s22 * s10 - s12 * s20) / det, np.nan)
+    result['a2'] = np.where(stable, (s11 * s20 - s12 * s10) / det, np.nan)
+    result['cond_number'] = np.where(stable, cond, np.nan)
+    result.iloc[:window + 2] = np.nan
+    return result
+
+
+def regime_ar2_eigenvalues(a1, a2):
+    disc = a1 ** 2 + 4.0 * a2
+    valid = ~np.isnan(disc)
+    has_real = valid & (disc >= 0)
+    has_complex = valid & (disc < 0)
+    sqrt_d = np.where(has_real, np.sqrt(np.maximum(disc, 0)), 0)
+    z1 = np.where(has_real, (a1 + sqrt_d) / 2.0, np.nan)
+    z2 = np.where(has_real, (a1 - sqrt_d) / 2.0, np.nan)
+    z1_mod, z2_mod = np.abs(z1), np.abs(z2)
+    real_dom_mod = np.where(has_real, np.maximum(z1_mod, z2_mod), np.nan)
+    dom_z = np.where(z1_mod >= z2_mod, z1, z2)
+    neg_root = has_real & (dom_z < 0)
+    cmod = np.where(has_complex, np.sqrt(np.abs(a2)), np.nan)
+    imag = np.where(has_complex, np.sqrt(np.maximum(-disc, 0)), 0)
+    carg = np.where(has_complex, np.arctan2(imag, a1), np.nan)
+    cycle = np.where(has_complex & (np.abs(carg) > 1e-9), (2 * np.pi) / carg, np.nan)
+    damp = np.where(has_complex & (cmod > 1e-9), -np.log(np.maximum(cmod, 1e-15)), np.nan)
+    dom_mod = np.where(has_real, real_dom_mod, np.where(has_complex, cmod, np.nan))
+    return dict(disc=disc, has_real=has_real, has_complex=has_complex,
+                real_dominant_mod=real_dom_mod, dominant_z=dom_z,
+                real_root_negative=neg_root, complex_mod=cmod,
+                cycle_period=cycle, damping_ratio=damp, dominant_mod=dom_mod)
+
+
+def regime_multi_window_ar2(log_returns, windows=None):
+    if windows is None:
+        windows = AR_WINDOWS
+    n = len(log_returns)
+    all_mods, all_weights, all_root_types = [], [], []
+    per_window = {}
+    for w in windows:
+        if w + 2 >= n:
+            continue
+        ar = regime_ar2_fit(log_returns, w)
+        eig = regime_ar2_eigenvalues(ar['a1'].values, ar['a2'].values)
+        weight = np.where(np.isnan(ar['cond_number'].values), 0, 1.0 / (ar['cond_number'].values + 1.0))
+        rt = np.full(n, -1)
+        rt[eig['real_root_negative']] = 2
+        rt[eig['has_real'] & ~eig['real_root_negative']] = 0
+        rt[eig['has_complex']] = 1
+        all_mods.append(eig['dominant_mod'])
+        all_weights.append(weight)
+        all_root_types.append(rt)
+        per_window[w] = dict(ar=ar, eig=eig, weight=weight)
+    if not all_mods:
+        raise ValueError("Not enough data for any AR window")
+    mods = np.array(all_mods)
+    weights = np.array(all_weights)
+    root_types = np.array(all_root_types)
+    valid = ~np.isnan(mods) & (weights > 0)
+    w_sum = np.where(valid, weights, 0).sum(axis=0)
+    w_mod = np.where(valid, weights * mods, 0).sum(axis=0)
+    consensus_mod = np.where(w_sum > 0, w_mod / w_sum, np.nan)
+    vote_counts = np.zeros((n, 3))
+    for j in range(len(all_mods)):
+        for rt in range(3):
+            mask = valid[j] & (root_types[j] == rt)
+            vote_counts[mask, rt] += weights[j][mask]
+    total_w = vote_counts.sum(axis=1)
+    consensus_rt = np.where(total_w > 0, np.argmax(vote_counts, axis=1), -1)
+    agreement = np.where(total_w > 0, vote_counts.max(axis=1) / total_w, 0)
+    cp_list = [per_window[w]['eig']['cycle_period'] for w in per_window]
+    cw_list = [per_window[w]['weight'] for w in per_window]
+    if cp_list:
+        cp_arr, cw_arr = np.array(cp_list), np.array(cw_list)
+        cp_v = ~np.isnan(cp_arr) & (cw_arr > 0)
+        cw_s = np.where(cp_v, cw_arr, 0).sum(axis=0)
+        cp_s = np.where(cp_v, cw_arr * cp_arr, 0).sum(axis=0)
+        cons_cycle = np.where(cw_s > 0, cp_s / cw_s, np.nan)
+    else:
+        cons_cycle = np.full(n, np.nan)
+    dr_list = [per_window[w]['eig']['damping_ratio'] for w in per_window]
+    dw_list = [per_window[w]['weight'] for w in per_window]
+    if dr_list:
+        dr_arr, dw_arr = np.array(dr_list), np.array(dw_list)
+        dr_v = ~np.isnan(dr_arr) & (dw_arr > 0)
+        dw_s = np.where(dr_v, dw_arr, 0).sum(axis=0)
+        dr_s = np.where(dr_v, dw_arr * dr_arr, 0).sum(axis=0)
+        cons_damp = np.where(dw_s > 0, dr_s / dw_s, np.nan)
+    else:
+        cons_damp = np.full(n, np.nan)
+    result = pd.DataFrame(index=log_returns.index)
+    result['dominant_mod'] = consensus_mod
+    result['root_type'] = consensus_rt
+    result['is_real_positive'] = consensus_rt == 0
+    result['is_complex'] = consensus_rt == 1
+    result['is_real_negative'] = consensus_rt == 2
+    result['cycle_period'] = cons_cycle
+    result['damping_ratio'] = cons_damp
+    result['agreement'] = agreement
+    result['n_valid_windows'] = valid.sum(axis=0)
+    primary_w = 200 if 200 in per_window else (list(per_window.keys())[0] if per_window else None)
+    if primary_w is not None:
+        result['a1'] = per_window[primary_w]['ar']['a1'].values
+        result['a2'] = per_window[primary_w]['ar']['a2'].values
+    else:
+        result['a1'] = np.nan
+        result['a2'] = np.nan
+    return result, per_window
+
+
+def regime_classify(df):
+    n = len(df)
+    mod = df['dominant_mod'].values
+    is_rp = df['is_real_positive'].values
+    is_cx = df['is_complex'].values
+    is_rn = df['is_real_negative'].values
+    kf_v = df['KF_Velocity'].values
+    close = df['Close'].values
+    ma20 = df['MA20'].values
+    ma60 = df['MA60'].values
+    zscore = df['Z_Score'].values
+    agreement = df['agreement'].values
+    mod_change = np.full(n, np.nan)
+    mod_pct_change = np.full(n, np.nan)
+    for i in range(1, n):
+        if not np.isnan(mod[i]) and not np.isnan(mod[i - 1]):
+            mod_change[i] = mod[i] - mod[i - 1]
+            if mod[i] > 1e-6:
+                mod_pct_change[i] = mod_change[i] / mod[i]
+    mod_rising = np.zeros(n, dtype=bool)
+    mod_falling = np.zeros(n, dtype=bool)
+    for i in range(2, n):
+        if not np.isnan(mod_pct_change[i]) and not np.isnan(mod[i - 2]):
+            if mod_pct_change[i] > MOD_PCT_THRESHOLD and mod[i] > mod[i - 2]:
+                mod_rising[i] = True
+            elif mod_pct_change[i] < -MOD_PCT_THRESHOLD and mod[i] < mod[i - 2]:
+                mod_falling[i] = True
+    mod_flat = ~mod_rising & ~mod_falling
+    osc_dir_up = (~np.isnan(kf_v) & (kf_v > 0) & ~np.isnan(ma20) & ~np.isnan(ma60) &
+                  (close > ma60) & (ma20 > ma60))
+    osc_dir_dn = (~np.isnan(kf_v) & (kf_v < 0) & ~np.isnan(ma20) & ~np.isnan(ma60) &
+                  (close < ma60) & (ma20 < ma60))
+    breakout_up = (is_rp & ~np.isnan(mod) & (mod < TREND_HEALTHY) &
+                   mod_rising & ~np.isnan(kf_v) & (kf_v > 0) &
+                   ~np.isnan(ma20) & ~np.isnan(ma60) &
+                   (close > ma60) & (ma20 > ma60) &
+                   ~np.isnan(zscore) & (zscore > -2.0) & (zscore < 1.5))
+    breakout_dn = (is_rp & ~np.isnan(mod) & (mod < TREND_HEALTHY) &
+                   mod_rising & ~np.isnan(kf_v) & (kf_v < 0) &
+                   ~np.isnan(ma20) & ~np.isnan(ma60) &
+                   (close < ma60) & (ma20 < ma60) &
+                   ~np.isnan(zscore) & (zscore < 2.0) & (zscore > -1.5))
+    mod_s3 = np.concatenate([np.full(3, np.nan), mod[:-3]])
+    exhaustion_base = (is_rp & ~np.isnan(mod) & (mod < TREND_HEALTHY) &
+                       ~np.isnan(mod_s3) & (mod_s3 >= TREND_HEALTHY) & mod_falling)
+    exhaustion_bear = exhaustion_base & ~np.isnan(kf_v) & (kf_v < 0)
+    exhaustion_bull = exhaustion_base & ~np.isnan(kf_v) & (kf_v > 0)
+    confidence = np.full(n, np.nan)
+    for i in range(n):
+        if not np.isnan(mod[i]):
+            nearest = min(abs(mod[i] - OSC_SUSTAINED), abs(mod[i] - TREND_HEALTHY), abs(mod[i] - OSC_DIVERGENT))
+            boundary_conf = min(nearest / CONFIDENCE_BANDWIDTH, 1.0) * 100.0
+            ag = agreement[i] if not np.isnan(agreement[i]) else 0.5
+            confidence[i] = boundary_conf * ag
+    labels, subs, directions = [], [], []
+    for i in range(n):
+        m = mod[i]
+        if np.isnan(m):
+            labels.append('insufficient'); subs.append('insufficient'); directions.append(0)
+            continue
+        if is_cx[i] or is_rn[i]:
+            if m > OSC_DIVERGENT:
+                base = 'divergent_osc'
+                sub = f'divergent_osc_{"rising" if mod_rising[i] else ("falling" if mod_falling[i] else "flat")}'
+                d = 0
+            elif m >= OSC_SUSTAINED:
+                base = 'sustained_osc'
+                sub = f'sustained_osc_{"rising" if mod_rising[i] else ("falling" if mod_falling[i] else "flat")}'
+                d = 0
+            else:
+                base = 'convergent_osc'
+                dtag = 'up' if osc_dir_up[i] else ('dn' if osc_dir_dn[i] else 'unclear')
+                d = 1 if osc_dir_up[i] else (-1 if osc_dir_dn[i] else 0)
+                mtag = 'rising' if mod_rising[i] else ('falling' if mod_falling[i] else 'flat')
+                sub = f'convergent_osc_{mtag}_{dtag}'
+            labels.append(base); subs.append(sub); directions.append(d)
+        elif is_rp[i]:
+            if m > TREND_EXPLOSIVE:
+                base = 'explosive_trend'
+                mtag = 'rising' if mod_rising[i] else ('falling' if mod_falling[i] else 'flat')
+                sub = f'explosive_trend_{mtag}'
+                d = 1 if (not np.isnan(kf_v[i]) and kf_v[i] > 0) else (-1 if (not np.isnan(kf_v[i]) and kf_v[i] < 0) else 0)
+            elif m >= TREND_HEALTHY:
+                base = 'healthy_trend'
+                mtag = 'rising' if mod_rising[i] else ('falling' if mod_falling[i] else 'flat')
+                sub = f'healthy_trend_{mtag}'
+                d = 1 if (not np.isnan(kf_v[i]) and kf_v[i] > 0) else (-1 if (not np.isnan(kf_v[i]) and kf_v[i] < 0) else 0)
+            else:
+                base = 'mean_reversion'
+                if mod_rising[i]:
+                    if breakout_up[i]: sub, d = 'mean_reversion_breakout_up', 1
+                    elif breakout_dn[i]: sub, d = 'mean_reversion_breakout_dn', -1
+                    else: sub, d = 'mean_reversion_unclear', 0
+                elif mod_flat[i]:
+                    sub, d = 'mean_reversion_flat', 0
+                else:
+                    if exhaustion_bear[i]: sub, d = 'mean_reversion_exhaustion_bear', -1
+                    elif exhaustion_bull[i]: sub, d = 'mean_reversion_exhaustion_bull', 1
+                    else: sub, d = 'mean_reversion_decay', 0
+            labels.append(base); subs.append(sub); directions.append(d)
+        else:
+            labels.append('insufficient'); subs.append('insufficient'); directions.append(0)
+    df['regime_confidence'] = confidence
+    df['regime_label'] = labels
+    df['regime_sub'] = subs
+    df['regime_direction'] = directions
+    return df
+
+
+def regime_signal_strength(df, base_risk=0.02):
+    kf_v = df['KF_Velocity'].values
+    close = df['Close'].values
+    atr20 = df['ATR20'].values
+    zscore = df['Z_Score'].values
+    confidence = df['regime_confidence'].values
+    direction = np.array(df['regime_direction'].values, dtype=float)
+    sub_list = df['regime_sub'].values
+    ma20 = df['MA20'].values
+    ma60 = df['MA60'].values
+    strength = np.array([REGIME_STRENGTH.get(s, 0.0) for s in sub_list])
+    regime_score = direction * strength
+    kf_score = np.where(~np.isnan(kf_v) & ~np.isnan(atr20) & (atr20 > 0),
+                        np.tanh(kf_v / (atr20 * 0.5)), 0.0)
+    ma_score = np.where((close > ma60) & (ma20 > ma60), 1.0,
+               np.where((close < ma60) & (ma20 < ma60), -1.0, 0.0))
+    z_adj = np.where(np.isnan(zscore), 0.0, np.clip(-zscore * 0.15, -0.3, 0.3))
+    conf_factor = np.where(np.isnan(confidence), 0.0, confidence / 100.0)
+    raw = 0.35 * regime_score + 0.30 * kf_score + 0.20 * ma_score + 0.15 * z_adj
+    df['signal_strength'] = np.clip(raw * conf_factor, -1.0, 1.0)
+    vol_norm = np.where((atr20 > 0) & (close > 0), atr20 / close, np.nan)
+    df['position_pct'] = np.where(~np.isnan(vol_norm) & (vol_norm > 0),
+                                  np.clip(df['signal_strength'].values * base_risk / vol_norm, -1.0, 1.0), 0.0)
+    return df
+
+
+def regime_walk_forward_backtest(df, forward_bars=None):
+    if forward_bars is None:
+        forward_bars = FORWARD_BARS
+    for fb in forward_bars:
+        df[f'fwd_{fb}'] = df['Close'].shift(-fb) / df['Close'] - 1
+    valid = df.dropna(subset=['regime_label'])
+    valid = valid[valid['regime_label'] != 'insufficient']
+    def _stats(subset, fb):
+        col = f'fwd_{fb}'
+        r = subset[col].dropna()
+        if len(r) < 6:
+            return {f'mean_{fb}': np.nan, f'median_{fb}': np.nan, f'win_{fb}': np.nan, f'sharpe_{fb}': np.nan}
+        return {
+            f'mean_{fb}': r.mean() * 100, f'median_{fb}': r.median() * 100,
+            f'win_{fb}': (r > 0).mean() * 100,
+            f'sharpe_{fb}': (r.mean() / r.std() * np.sqrt(252 / fb)) if r.std() > 0 else 0,
+        }
+    rows_main = []
+    for regime in valid['regime_label'].unique():
+        sub = valid[valid['regime_label'] == regime]
+        row = {'regime': regime, 'count': len(sub)}
+        for fb in forward_bars:
+            row.update(_stats(sub, fb))
+        rows_main.append(row)
+    rows_sub = []
+    for sub_name in valid['regime_sub'].unique():
+        sub = valid[valid['regime_sub'] == sub_name]
+        row = {'regime_sub': sub_name, 'count': len(sub)}
+        for fb in forward_bars:
+            row.update(_stats(sub, fb))
+        rows_sub.append(row)
+    bt_main = pd.DataFrame(rows_main).set_index('regime') if rows_main else pd.DataFrame()
+    bt_sub = pd.DataFrame(rows_sub).set_index('regime_sub') if rows_sub else pd.DataFrame()
+    return bt_main, bt_sub
+
+
+def regime_run_full(stock_df):
+    """Run full regime pipeline on stock_df (OHLCV, index may be DatetimeIndex or 'Date' column).
+    Returns (regime_df, bt_main, bt_sub) or (None, empty, empty) on failure."""
+    try:
+        if 'Date' in stock_df.columns:
+            rdf = stock_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+            rdf.index = pd.to_datetime(rdf['Date'])
+        else:
+            rdf = stock_df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+            rdf.index = pd.to_datetime(rdf.index)
+
+        c = rdf['Close'].values.astype(np.float64)
+        h = rdf['High'].values.astype(np.float64)
+        lo = rdf['Low'].values.astype(np.float64)
+        o = rdf['Open'].values.astype(np.float64)
+
+        for period, name in [(20, 'MA20'), (60, 'MA60')]:
+            rdf[name] = talib.SMA(c, timeperiod=min(period, len(c)))
+        rdf['ATR14'] = talib.ATR(h, lo, c, timeperiod=14)
+        rdf['ATR20'] = talib.ATR(h, lo, c, timeperiod=20)
+        rdf['Log_Return'] = np.log(rdf['Close'] / rdf['Close'].shift(1))
+        lr = rdf['Log_Return']
+        lr_mean = lr.rolling(200).mean()
+        lr_std = lr.rolling(200).std()
+        rdf['Z_Score'] = np.where(lr_std > 0, (lr - lr_mean) / lr_std, np.nan)
+
+        # TD9
+        close_s = rdf['Close']
+        close_4ago = close_s.shift(4)
+        up = (close_s > close_4ago).astype(int)
+        dn = (close_s < close_4ago).astype(int)
+        up_count = np.zeros(len(rdf))
+        dn_count = np.zeros(len(rdf))
+        for i in range(len(rdf)):
+            up_count[i] = (up_count[i - 1] + 1) if (i > 0 and up.iloc[i]) else up.iloc[i]
+            dn_count[i] = (dn_count[i - 1] + 1) if (i > 0 and dn.iloc[i]) else dn.iloc[i]
+        rdf['TD9_Up'] = up_count == 9
+        rdf['TD9_Down'] = dn_count == 9
+
+        # FVG
+        atr14 = rdf['ATR14'].values
+        bullish_fvg = np.zeros(len(rdf), dtype=bool)
+        bearish_fvg = np.zeros(len(rdf), dtype=bool)
+        for i in range(2, len(rdf)):
+            mid_body = abs(c[i - 1] - o[i - 1])
+            mid_range = h[i - 1] - lo[i - 1]
+            if mid_range <= 0 or np.isnan(atr14[i]):
+                continue
+            strong = (mid_body / mid_range) >= 0.7
+            if (h[i - 2] < lo[i] and strong and c[i - 1] > o[i - 1] and
+                    (lo[i] - h[i - 2]) > atr14[i] * 1.2):
+                bullish_fvg[i] = True
+            if (lo[i - 2] > h[i] and strong and c[i - 1] < o[i - 1] and
+                    (lo[i - 2] - h[i]) > atr14[i] * 1.2):
+                bearish_fvg[i] = True
+        rdf['Bullish_FVG'] = bullish_fvg
+        rdf['Bearish_FVG'] = bearish_fvg
+
+        # KF
+        kf_x, kf_v = regime_kalman_filter(c)
+        rdf['KF_Position'] = kf_x
+        rdf['KF_Velocity'] = kf_v
+
+        # AR(2) → classify → signal → backtest
+        ar_result, _ = regime_multi_window_ar2(rdf['Log_Return'])
+        for col in ar_result.columns:
+            rdf[col] = ar_result[col].values
+        rdf = regime_classify(rdf)
+        rdf = regime_signal_strength(rdf)
+        bt_main, bt_sub = regime_walk_forward_backtest(rdf)
+        return rdf, bt_main, bt_sub
+    except Exception as e:
+        print(f'  WARNING: regime analysis failed: {e}')
+        return None, pd.DataFrame(), pd.DataFrame()
+
+
+def regime_build_backtest_html(bt_main, bt_sub, current_label, current_sub):
+    """Build HTML table strings for backtest results."""
+    bt_html = ""
+    if not bt_main.empty:
+        bt_rows = []
+        for rname in bt_main.index:
+            rd = bt_main.loc[rname]
+            display = REGIME_DISPLAY.get(rname, rname)
+            marker = ' ◄' if rname == current_label else ''
+            cells = [f'<td style="text-align:left">{display}{marker}</td>',
+                     f'<td>{int(rd["count"])}</td>']
+            for fb in FORWARD_BARS:
+                m = rd.get(f'mean_{fb}', np.nan)
+                wr = rd.get(f'win_{fb}', np.nan)
+                sh = rd.get(f'sharpe_{fb}', np.nan)
+                if not np.isnan(m):
+                    color = '#00AA55' if m > 0 else '#CC3333'
+                    cells.append(f'<td style="color:{color}">{m:+.2f}%</td>')
+                    cells.append(f'<td>{wr:.0f}%</td>')
+                    cells.append(f'<td>{sh:.2f}</td>')
+                else:
+                    cells.extend(['<td>—</td>'] * 3)
+            bt_rows.append('<tr>' + ''.join(cells) + '</tr>')
+        hdrs = ['<th>Regime</th>', '<th>N</th>']
+        for fb in FORWARD_BARS:
+            hdrs.extend([f'<th>{fb}d Mean</th>', f'<th>{fb}d Win%</th>', f'<th>{fb}d Sharpe</th>'])
+        bt_html = (f'<h2 style="color:#fff;margin-top:30px">Walk-Forward Backtest Results</h2>'
+                   f'<table class="bt"><thead><tr>{"".join(hdrs)}</tr></thead>'
+                   f'<tbody>{"".join(bt_rows)}</tbody></table>')
+
+    sub_html = ""
+    if not bt_sub.empty:
+        sub_rows = []
+        for sname in bt_sub.index:
+            rd = bt_sub.loc[sname]
+            disp, advice = REGIME_SUB_DISPLAY.get(sname, (sname, ''))
+            marker = ' ◄' if sname == current_sub else ''
+            base_label = sname.rsplit('_', 1)[0] if '_' in sname else sname
+            for k in REGIME_COLORS:
+                if sname.startswith(k):
+                    base_label = k
+                    break
+            color_td = REGIME_COLORS.get(base_label, '#ccc') if sname == current_sub else '#ccc'
+            cells = [
+                f'<td style="text-align:left;border-left:3px solid {color_td}">{disp}{marker}</td>',
+                f'<td style="text-align:left;color:#888">{advice}</td>',
+                f'<td>{int(rd["count"])}</td>']
+            for fb in FORWARD_BARS:
+                m = rd.get(f'mean_{fb}', np.nan)
+                wr = rd.get(f'win_{fb}', np.nan)
+                sh = rd.get(f'sharpe_{fb}', np.nan)
+                if not np.isnan(m):
+                    color = '#00AA55' if m > 0 else '#CC3333'
+                    cells.append(f'<td style="color:{color}">{m:+.2f}%</td>')
+                    cells.append(f'<td>{wr:.0f}%</td>')
+                    cells.append(f'<td>{sh:.2f}</td>')
+                else:
+                    cells.extend(['<td>—</td>'] * 3)
+            sub_rows.append('<tr>' + ''.join(cells) + '</tr>')
+        shdrs = ['<th style="text-align:left">Regime Sub-State</th>',
+                  '<th style="text-align:left">Action</th>', '<th>N</th>']
+        for fb in FORWARD_BARS:
+            shdrs.extend([f'<th>{fb}d Mean</th>', f'<th>{fb}d Win%</th>', f'<th>{fb}d Sharpe</th>'])
+        sub_html = (f'<h2 style="color:#fff;margin-top:30px">Detailed Sub-State Backtest</h2>'
+                    f'<table class="bt"><thead><tr>{"".join(shdrs)}</tr></thead>'
+                    f'<tbody>{"".join(sub_rows)}</tbody></table>')
+
+    if not bt_html and not sub_html:
+        return ""
+    table_css = ('<style>'
+                 '.bt{border-collapse:collapse;margin:20px auto;font-size:15px;font-family:"Courier New",monospace;background:#fff}'
+                 '.bt th,.bt td{border:1px solid #ddd;padding:8px 12px;text-align:right;color:#333}'
+                 '.bt th{background:#f5f5f5;color:#222;font-weight:bold}'
+                 '.bt tr:nth-child(even){background:#fafafa}'
+                 '.bt tr:hover{background:#eef6ff}'
+                 '</style>')
+    return f"{table_css}{bt_html}{sub_html}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main combined chart function
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -691,6 +1251,12 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
   except Exception as e:
     print_exception(e)
     return
+
+  # ── 3b. AR(2) Regime analysis (KF, TD9, FVG, backtest) ───────────
+  print(f'  Running regime analysis...')
+  _regime_df, _regime_bt_main, _regime_bt_sub = regime_run_full(stock_df)
+  if _regime_df is not None:
+    print(f'  Regime: {_regime_df.iloc[-1]["regime_sub"]}')
 
   # ── 4. Resample 對齊日頻（供 pyecharts panels 使用） ───────────────
   if 'priceFloor'   not in stock: stock['priceFloor']   = stock_df['Close'].min()
@@ -1135,6 +1701,30 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
       itemstyle_opts=opts.ItemStyleOpts(color=col),
     ))
 
+  # ── 7b2. TD9 + FVG markpoints (from regime analysis) ────────────────
+  if _regime_df is not None:
+    for i in range(len(_regime_df)):
+      if _regime_df['TD9_Up'].iloc[i]:
+        data_points.append(opts.MarkPointItem(
+          name='TD9↓', coord=[dates[i], float(stock_df['High'].iloc[i] * 1.03)],
+          value='9', symbol='triangle', symbol_size=8,
+          itemstyle_opts=opts.ItemStyleOpts(color='#333')))
+      if _regime_df['TD9_Down'].iloc[i]:
+        data_points.append(opts.MarkPointItem(
+          name='TD9↑', coord=[dates[i], float(stock_df['Low'].iloc[i] * 0.97)],
+          value='9', symbol='triangle', symbol_size=8,
+          itemstyle_opts=opts.ItemStyleOpts(color='#333')))
+      if _regime_df['Bullish_FVG'].iloc[i]:
+        data_points.append(opts.MarkPointItem(
+          name='Bull FVG', coord=[dates[max(0, i - 1)], float(stock_df['Low'].iloc[i] * 0.97)],
+          value='F', symbol='arrow', symbol_size=7,
+          itemstyle_opts=opts.ItemStyleOpts(color='#FFA500')))
+      if _regime_df['Bearish_FVG'].iloc[i]:
+        data_points.append(opts.MarkPointItem(
+          name='Bear FVG', coord=[dates[max(0, i - 1)], float(stock_df['High'].iloc[i] * 1.03)],
+          value='F', symbol='arrow', symbol_size=7,
+          itemstyle_opts=opts.ItemStyleOpts(color='#FFA500')))
+
   # ── 7c. Volume Profile / POC markline ──────────────────────────────
   VP_SEGS = 150
   VP_BARS = 200
@@ -1294,6 +1884,18 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
                areastyle_opts=opts.AreaStyleOpts(opacity=1, color=c_white), z=-1)
     .set_global_opts(xaxis_opts=opts.AxisOpts(type_='category'))
   )
+  if _regime_df is not None:
+    kf_line = (
+      Line()
+      .add_xaxis(xaxis_data=dates)
+      .add_yaxis('KF', _regime_df['KF_Position'].map(f_str.format).tolist(),
+                 is_smooth=False, is_symbol_show=False, is_hover_animation=False,
+                 linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.9, color='#00BFFF'),
+                 label_opts=opts.LabelOpts(is_show=False),
+                 itemstyle_opts=opts.ItemStyleOpts(color='#00BFFF'), z=7)
+      .set_global_opts(xaxis_opts=opts.AxisOpts(type_='category'))
+    )
+    lines_chart = lines_chart.overlap(kf_line)
   overlap_kline_line = kline_chart.overlap(lines_chart)
 
   atr_lines = (
@@ -1892,6 +2494,20 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
   # ── 13. 輸出 HTML ─────────────────────────────────────────────────
   save_html = dir + '/' + ticker + '_OC.html'
   grid_chart.render(save_html)
+
+  # Inject regime backtest tables into HTML
+  if _regime_df is not None and (not _regime_bt_main.empty or not _regime_bt_sub.empty):
+    current_label = _regime_df.iloc[-1]['regime_label']
+    current_sub = _regime_df.iloc[-1]['regime_sub']
+    tables_html = regime_build_backtest_html(_regime_bt_main, _regime_bt_sub, current_label, current_sub)
+    #print(tables_html)
+    if tables_html:
+      with open(save_html, 'r', encoding='utf-8') as fh:
+        html_content = fh.read()
+      html_content = html_content.replace('</body>', f'{tables_html}</body>')
+      with open(save_html, 'w', encoding='utf-8') as fh:
+        fh.write(html_content)
+
   print(f'  Saved: {save_html}')
   return save_html
 

@@ -105,6 +105,8 @@ def stock_is_tw_otc(ticker):
       ]['market'].iloc[0]
       if exchange_query == "OTC":
         t = t_digit + ".TWO"
+      elif exchange_query == "Emerging":
+        t = t_digit + ".TWO"
       else:
         t = t_digit + ".TW"
     except Exception:

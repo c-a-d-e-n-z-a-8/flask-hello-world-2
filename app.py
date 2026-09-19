@@ -2513,7 +2513,7 @@ class StockMonitor:
     import xml.etree.ElementTree as ET
     entries = []
     try:
-      r = requests.get(f'https://www.ptt.cc/atom/{board}.xml', timeout=10, verify=False)
+      r = requests.get(f'https://www.ptt.cc/atom/{board}.xml', impersonate="chrome120", timeout=10, verify=False)
       if r.status_code == 200:
         root = ET.fromstring(r.text)
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
@@ -2539,14 +2539,16 @@ class StockMonitor:
 
   def get_ptt_news(self, keywords):
     news_list = []
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36"}
     url = 'https://www.ptt.cc/bbs/Stock/index.html'
     try:
       for i in range(5):
-        r = requests.get(url, headers=headers, verify=False, cookies={'over18': '1'}, timeout=10)
+        r = requests.get(url, impersonate="chrome120", verify=False, cookies={'over18': '1'}, timeout=10)
         if r.status_code == 200:
           soup = BS(r.text, 'html.parser')
           articles = soup.select('div.r-ent')
+          if not articles:
+            print("[WARN] PTT News: 200 but no articles (Cloudflare soft-block), falling back to RSS")
+            break
           paging = soup.select('div.btn-group-paging a')
           if not paging or len(paging) < 2:
             break
@@ -2595,19 +2597,21 @@ class StockMonitor:
 
   def get_ptt_tickers(self, portfolio):
     news_list = []
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36"}
     url = 'https://www.ptt.cc/bbs/Stock/index.html'
     scrape_ok = False
 
     try:
       for _ in range(5):
-        r = requests.get(url, headers=headers, verify=False, cookies={'over18': '1'}, timeout=10)
+        r = requests.get(url, impersonate="chrome120", verify=False, cookies={'over18': '1'}, timeout=10)
         if r.status_code == 200:
-          scrape_ok = True
           r.encoding = 'utf-8'
 
           soup = BS(r.text, 'html.parser')
           articles = soup.select('div.r-ent')
+          if not articles:
+            print("[WARN] PTT Tickers: 200 but no articles (Cloudflare soft-block), falling back to RSS")
+            break
+          scrape_ok = True
           paging = soup.select('div.btn-group-paging a')
           if not paging or len(paging) < 2:
             break
@@ -2669,19 +2673,21 @@ class StockMonitor:
   
   def get_ptt_authors(self, board, names):
     news_list = []
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36"}
     url = f'https://www.ptt.cc/bbs/{board}/index.html'
     scrape_ok = False
     
     try:
       for _ in range(10):
-        r = requests.get(url, headers=headers, verify=False, cookies={'over18': '1'}, timeout=10)
+        r = requests.get(url, impersonate="chrome120", verify=False, cookies={'over18': '1'}, timeout=10)
         if r.status_code == 200:
-          scrape_ok = True
           r.encoding = 'utf-8'
           
           soup = BS(r.text, 'html.parser')
           articles = soup.select('div.r-ent')
+          if not articles:
+            print("[WARN] PTT Authors: 200 but no articles (Cloudflare soft-block), falling back to RSS")
+            break
+          scrape_ok = True
           paging = soup.select('div.btn-group-paging a')
           if not paging or len(paging) < 2:
             break

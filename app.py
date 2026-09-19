@@ -1,3349 +1,4780 @@
-# -*- coding: utf-8 -*-
-"""
-Flask web UI — YfinanceQuery (standalone / git-friendly)
-
-All required functions from main.py and report.py are embedded directly;
-no local imports are needed. Safe to share or run without companion files.
-
-Usage:
-  pip install flask curl_cffi pandas numpy scipy talib pyecharts lxml
-  python app.py               # listens on http://127.0.0.1:5000
-  python app.py --port 8080
-  python app.py --host 0.0.0.0 --port 8080
-"""
-
-import argparse
-import datetime
-import gc
-import html as _html
-import os
-import sys
-import tempfile
-import traceback
-from io import StringIO
-from random import randint
-from time import sleep, time
-
-import numpy as np
-np.seterr(all='ignore')
-
+from flask import Flask, request, render_template, Response, jsonify, render_template_string
+import yfinance as yf
 import pandas as pd
-
-from curl_cffi import requests
-from lxml import etree
-from scipy.signal import argrelextrema
 import talib
+#import requests
+import json
+import gc
+import os
+from itertools import dropwhile
+from io import StringIO
+import re
 
+from urllib.parse import urljoin
+import random
+
+from pyecharts.charts import Bar, Tab
 from pyecharts import options as opts
-from pyecharts.charts import Kline, Line, Bar, Grid
-from pyecharts.globals import CurrentConfig
+from pyecharts.commons.utils import JsCode
 
-from flask import Flask, redirect, request, send_file
+from datetime import date, datetime, timedelta
+from curl_cffi import requests
+import numpy as np
+from pyecharts.charts import Line
 
-# ── CDN for pyecharts assets ─────────────────────────────────────────────────
-CurrentConfig.ONLINE_HOST = "https://cdn.jsdelivr.net/gh/c-a-d-e-n-z-a/misc@refs/heads/main/"
+import time
+import traceback
+from bs4 import BeautifulSoup as BS
+from zoneinfo import ZoneInfo
 
-# ── URL constants ─────────────────────────────────────────────────────────────
+
+# Initialization
+api_key = os.environ.get('API_KEY')
 cm_url = os.environ.get('CM_URL')
 cm_url2 = os.environ.get('CM_URL2')
 si_url = os.environ.get('SI_URL')
 tw_sf_url = os.environ.get('TW_SF_URL')
+portfolio_url = os.environ.get('PORTFOLIO_URL')
+yahoo_url = os.environ.get('YAHOO_URL')
+
+use_ollama = False
+ollama_model = "deepseek-r1:8b"
+
+BARS = 200
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Functions from main.py
-# ═══════════════════════════════════════════════════════════════════════════════
-
-MA_TYPE           = 0     # 0=SMA, 1=EMA, 2=WMA … (talib MA_Type)
-
-# ── Global state ─────────────────────────────────────────────────────────────
-error_ticker = ""
+app = Flask(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Helper utilities
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def print_exception(estring):
-  print(f'[EXCEPTION] {error_ticker}\n{estring}\n{traceback.format_exc()}\n')
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Ticker helpers
-# ═══════════════════════════════════════════════════════════════════════════════
+################################################################################################################################################################
+@app.route('/link/')
+def link():
+  links = []
+  for rule in app.url_map.iter_rules():
+    if "GET" in rule.methods and not rule.rule.startswith('/static'):
+        links.append((rule.endpoint, rule.rule))
+  html = '''
+  <!DOCTYPE html>
+  <html lang="zh">
+  <head>
+    <meta charset="UTF-8">
+    <title>所有路由</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  </head>
+  <body>
+    <div class="container mt-5">
+        <h1 class="mb-4">Links</h1>
+        <ul class="list-group">
+        {% for endpoint, url in links %}
+            <li class="list-group-item">
+                <a href="{{ url }}" class="link-primary">{{ url }}</a>
+                <span class="badge bg-secondary ms-2">{{ endpoint }}</span>
+            </li>
+        {% endfor %}
+        </ul>
+    </div>
+  </body>
+  </html>
+  '''
+  return render_template_string(html, links=links)
 
-def stock_is_tw_otc(ticker):
-  """
-  輸入格式 '00631L.' 或 '0050.' → 輸出 '00631L.TWO' 或 '0050.TW'
-  若不含 '.' 則直接回傳（視為美股）。
-  """
-  if ticker.find('.') == -1:
-    return ticker
 
-  t_digit = ticker[:ticker.find('.')]
-  t = t_digit + ".TW"
 
-  if stock_is_tw_otc.ticker_exist == False:
+
+################################################################################################################################################################
+################################################################################################################################################################
+def fetch_tw_whale(ticker):
+  
+  return_value = {}
+  
+  if ".TW" in ticker:
+
+    # Get CMoney CK key first
     headers = {
-      'referer': 'https://www.wantgoo.com/',
-      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-      'x-requested-with': 'XMLHttpRequest',
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Connection': 'keep-alive',
+      'Referer': f'{cm_url}?action=mf&id={ticker}',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
+      'X-Requested-With': 'XMLHttpRequest',
+      'sec-ch-ua': '"Microsoft Edge";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
     }
-    try:
-      r = requests.get('https://www.wantgoo.com/investrue/all-alive', headers=headers)
-      if r.status_code != 404:
-        r.encoding = 'utf-8'
-        stock_is_tw_otc.df_ticker = pd.read_json(StringIO(r.text), orient='records')
-        stock_is_tw_otc.ticker_exist = True
-    except Exception:
-      pass
-
-  if stock_is_tw_otc.ticker_exist == True:
-    try:
-      exchange_query = stock_is_tw_otc.df_ticker.iloc[
-        stock_is_tw_otc.df_ticker.loc[stock_is_tw_otc.df_ticker['id'] == t_digit].index
-      ]['market'].iloc[0]
-      if exchange_query == "OTC":
-        t = t_digit + ".TWO"
-      elif exchange_query == "Emerging":
-        t = t_digit + ".TWO"
-      else:
-        t = t_digit + ".TW"
-    except Exception:
-      pass
-
-  return t
-
-stock_is_tw_otc.ticker_exist = False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Data readers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def stock_datareader_yahoo(ticker, start, end, session=None, div_recovered=False):
-
-  headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-
-  crumb = ""
-  startDate_epoch = int(datetime.datetime.combine(start, datetime.datetime.now().time()).timestamp())
-  endDate_epoch   = int(datetime.datetime.combine(end,   datetime.datetime.now().time()).timestamp())
-
-  csv_url = (
-    f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
-    f"?period1={startDate_epoch}&period2={endDate_epoch}"
-    f"&interval=1d&events=history&includeAdjustedClose=true&events=div%2Csplits"
-  )
-  if crumb:
-    csv_url += f"&crumb={crumb}"
-
-  print('  url=' + csv_url)
-  r = session.get(csv_url, headers=headers, timeout=5)
-  r.encoding = 'utf-8'
-  print(f'  status_code={r.status_code}')
-
-  if r.status_code != 200:
-    return pd.DataFrame()
-
-  data = r.json()
-  quote_data    = data["chart"]["result"][0]["indicators"]["quote"][0]
-  adjclose_data = data["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"]
-
-  df = pd.DataFrame({
-    "Date":      data["chart"]["result"][0]["timestamp"],
-    "Open":      quote_data["open"],
-    "High":      quote_data["high"],
-    "Low":       quote_data["low"],
-    "Close":     quote_data["close"],
-    "Adj Close": adjclose_data,
-    "Volume":    quote_data["volume"],
-  })
-
-  if div_recovered:
-    ratio        = df['Adj Close'] / df['Close']
-    df['Open']  *= ratio
-    df['High']  *= ratio
-    df['Low']   *= ratio
-    df['Volume'] /= ratio
-    df['Close']  = df['Adj Close']
-
-  df['Date'] = pd.to_datetime(df['Date'], unit='s')
-  df.set_index('Date', inplace=True, drop=True)
-  return df
-
-
-def stock_datareader_cnyes(ticker, start, end, session=None):
-
-  startDate_epoch = datetime.datetime.combine(start, datetime.datetime.now().time()).timestamp()
-  endDate_epoch   = datetime.datetime.combine(end,   datetime.datetime.now().time()).timestamp()
-
-  if '.TWG' in ticker.upper():
-    symbol = 'TWG:' + ticker[:ticker.index('.')]
-  else:
-    symbol = 'TWS:' + ticker[:ticker.index('.')]
-
-  headers = {"User-Agent": 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36'}
-  url = (
-    f'https://ws.api.cnyes.com/ws/api/v1/charting/history'
-    f'?resolution=D&symbol={symbol}:STOCK&from={endDate_epoch:.0f}&to={startDate_epoch:.0f}'
-  )
-  print("  url=" + url)
-
-  r = session.get(url, headers=headers)
-  retry_no = 0
-  while r.status_code != 200 and retry_no < 10:
-    sleep(randint(1, 3))
-    print('  Retrying ' + ticker)
-    r = session.get(url, headers=headers)
-    retry_no += 1
-
-  json_data = r.json()['data']
-  for key in ['s', 'quote', 'session', 'nextTime']:
-    json_data.pop(key, None)
-
-  df = pd.DataFrame.from_dict(json_data)
-  df.index = pd.to_datetime(df['t'], errors='ignore', unit='s')
-  df.drop(['t'], axis=1, inplace=True)
-  df = df.rename(columns={'h': 'High', 'l': 'Low', 'o': 'Open', 'c': 'Close', 'v': 'Volume'})
-  df = df.reindex(['High', 'Low', 'Open', 'Close', 'Volume'], axis=1)
-  df['PE'] = ''
-  df.sort_index(inplace=True)
-  df.index.name = 'Date'
-  return df
-
-
-def stock_datareader_cnyes_index(ticker, start, end, session=None):
-
-  startDate_epoch = datetime.datetime.combine(start, datetime.datetime.now().time()).timestamp()
-  endDate_epoch   = datetime.datetime.combine(end,   datetime.datetime.now().time()).timestamp()
-
-  ticker_change = {'^TWII': 'TWS:TSE01:INDEX', '^TWOII': 'TWS:OTC01:INDEX'}
-
-  headers = {"User-Agent": 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36'}
-  url = (
-    f"https://ws.api.cnyes.com/ws/api/v1/charting/history"
-    f"?symbol={ticker_change[ticker]}&resolution=D&quote=1"
-    f"&from={endDate_epoch:.0f}&to={startDate_epoch:.0f}"
-  )
-
-  r = session.get(url, headers=headers)
-  retry_no = 0
-  while r.status_code != 200 and retry_no < 10:
-    sleep(randint(1, 3))
-    print('  Retrying ' + ticker)
-    r = session.get(url, headers=headers)
-    retry_no += 1
-
-  json_data = r.json()['data']
-  for key in ['s', 'quote', 'session', 'nextTime']:
-    json_data.pop(key, None)
-
-  df = pd.DataFrame.from_dict(json_data)
-  df.index = pd.to_datetime(df['t'], errors='ignore', unit='s')
-  df.drop(['t'], axis=1, inplace=True)
-  df = df.rename(columns={'h': 'High', 'l': 'Low', 'o': 'Open', 'c': 'Close', 'v': 'Volume'})
-  df = df.reindex(['High', 'Low', 'Open', 'Close', 'Volume'], axis=1)
-  df['Adj Close'] = df['Close']
-  df.sort_index(inplace=True)
-  df.index.name = 'Date'
-  df['Volume'] = [(x / 10 if x > df['Volume'].mean() * 8 else x) for x in df['Volume']]
-  return df
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# talib statistics
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def talib_stats_calculation_stock(dataframe):
-  dataframe['Slow K'], dataframe['Slow D'] = talib.STOCH(
-    dataframe['High'].values, dataframe['Low'].values, dataframe['Close'].values,
-    fastk_period=9, slowk_period=3, slowk_matype=MA_TYPE,
-    slowd_period=3, slowd_matype=MA_TYPE,
-  )
-  dataframe['Slow J']   = 3 * dataframe['Slow K'] - 2 * dataframe['Slow D']
-  dataframe['CCI']      = talib.CCI(dataframe['High'].values, dataframe['Low'].values, dataframe['Close'].values)
-  dataframe['RSI 14']   = talib.RSI(dataframe['Close'], timeperiod=14)
-  dataframe['MACD'], dataframe['MACD Signal'], dataframe['MACD Hist'] = talib.MACD(
-    dataframe['Close'], fastperiod=12, slowperiod=26, signalperiod=9
-  )
-
-
-def talib_stats_calculation_stock_week(dataframe):
-  talib_stats_calculation_stock(dataframe)
-  dataframe['Vel']  = np.gradient((dataframe['High'] + dataframe['Low'] + dataframe['Close']) / 3)
-  dataframe['Mom']  = dataframe['Vel'] * dataframe['Volume']
-  dataframe['Work'] = dataframe['Mom'] * dataframe['Vel'] * np.sign(dataframe['Vel'])
-  dataframe['Work'] = (dataframe['Work'] - dataframe['Work'].mean()) / dataframe['Work'].std()
-
-
-def talib_stats_calculation_stock_day(dataframe, coin=False):
-  talib_stats_calculation_stock(dataframe)
-
-  if coin:
-    dataframe['MA 10']  = talib.MA(dataframe['Close'], 14,  matype=MA_TYPE)
-    dataframe['MA 20']  = talib.MA(dataframe['Close'], 30,  matype=MA_TYPE)
-    dataframe['MA 60']  = talib.MA(dataframe['Close'], 89,  matype=MA_TYPE)
-    dataframe['MA 150'] = talib.MA(dataframe['Close'], 222, matype=MA_TYPE)
-    dataframe['MA 200'] = talib.MA(dataframe['Close'], 296, matype=MA_TYPE)
-  else:
-    dataframe['MA 10']  = talib.MA(dataframe['Close'], 10,  matype=MA_TYPE)
-    dataframe['MA 20']  = talib.MA(dataframe['Close'], 20,  matype=MA_TYPE)
-    dataframe['MA 60']  = talib.MA(dataframe['Close'], 60,  matype=MA_TYPE)
-    dataframe['MA 150'] = talib.MA(dataframe['Close'], 150, matype=MA_TYPE)
-    dataframe['MA 200'] = talib.MA(dataframe['Close'], 200, matype=MA_TYPE)
-
-  dataframe['Vol MA 20'] = talib.MA(dataframe['Volume'], 20, matype=MA_TYPE)
-
-  dataframe['ATR']   = talib.ATR(dataframe['High'], dataframe['Low'], dataframe['Close'], timeperiod=20)
-  dataframe['ATR 5'] = talib.ATR(dataframe['High'], dataframe['Low'], dataframe['Close'], timeperiod=5)
-
-  dataframe['Chandelier Exit'] = dataframe['High'].rolling(window=20).max() - 3 * dataframe['ATR']
-  dataframe['Chandelier Stop'] = dataframe['Low'].rolling(window=20).min()  + 3 * dataframe['ATR']
-
-  dataframe['Vel']    = np.gradient((dataframe['High'] + dataframe['Low'] + dataframe['Close']) / 3)
-  dataframe['Vel (5)'] = talib.MA(dataframe['Vel'], 5, matype=MA_TYPE)
-  dataframe['Vel (5)'] = (dataframe['Vel (5)'] - dataframe['Vel (5)'].mean()) / dataframe['Vel (5)'].std()
-
-  dataframe['Mom']      = dataframe['Vel'] * dataframe['Volume']
-  dataframe['Work']     = dataframe['Mom'] * dataframe['Vel'] * np.sign(dataframe['Vel'])
-  dataframe['Work (5)'] = talib.MA(dataframe['Work'], 5, matype=MA_TYPE)
-  dataframe['Work (5)'] = (dataframe['Work (5)'] - dataframe['Work (5)'].mean()) / dataframe['Work (5)'].std()
-
-  dataframe['MACD (R)'], dataframe['MACD Signal (R)'], dataframe['MACD Hist (R)'] = talib.MACD(
-    dataframe['Close'], fastperiod=50, slowperiod=120, signalperiod=30
-  )
-
-  dataframe['MA 200 Diff'] = (dataframe['Close'] - dataframe['MA 200']) / dataframe['MA 200'] * 100
-
-  bb_period = 89 if coin else 60
-  dataframe['BB Upper'], dataframe['BB Middle'], dataframe['BB Lower'] = talib.BBANDS(
-    dataframe['Close'].values, timeperiod=bb_period, nbdevup=2, nbdevdn=2, matype=MA_TYPE
-  )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Volume Profile helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def vp_get_vp_and_poc(dataframe, bars=200, segs=150, fmt_str='{:.2f}'):
-  """
-  計算 Volume Profile 與 Point of Control (POC)。
-
-  Returns
-  -------
-  (vp, poc_idx) : (pd.Series, str) or (None, -1)
-      vp 為各價位區間的成交量，poc_idx 為最大成交量價位的索引。
-  """
-  if (dataframe['Volume'].iloc[-1] != 0) and (len(dataframe) > bars):
-    vp_raw = dataframe.tail(bars)
-    vp_high = vp_raw['High'].max()
-    vp_low  = vp_raw['Low'].min()
-    vp_levels     = []
-    vp_levels_sum = []
-
-    for s in range(segs + 1):
-      vp_levels.append(vp_low + (s * (vp_high - vp_low) / segs))
-
-    for i in range(len(vp_levels) - 1):
-      vol_sum = 0
-      for k in range(len(vp_raw)):
-        if (vp_raw['High'].iloc[k] > vp_levels[i]) and (vp_raw['Low'].iloc[k] < vp_levels[i + 1]):
-          vol_sum += vp_raw['Volume'].iloc[k]
-      vp_levels_sum.append(vol_sum)
-
-    vp = pd.Series(vp_levels_sum, index=vp_levels[:-1])  # segs vs. segs+1
-    vp.index = vp.index.map(fmt_str.format)
-
-    return vp, vp.idxmax()    # Return VP series and POC index
-  else:
-    return None, -1
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Critical points helpers (ported from report.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _math_strictly_increasing(L):
-  return all(x < y for x, y in zip(L, L[1:]))
-
-def _math_strictly_decreasing(L):
-  return all(x > y for x, y in zip(L, L[1:]))
-
-
-def _critical_points_before(stock_df, stock_df_w, stock_df_m, stock):
-  """Port of stock_check_critical_points_before_resample.
-  Returns list of note strings ([BUY]/[SELL]/[OTHER]).
-  stock_df_w / stock_df_m are the original (non-resampled) weekly/monthly frames.
-  """
-  buy   = []
-  sell  = []
-  other = []
-
-  c_l6ds      = stock_df['Close'].values[-6:]
-  c_l3ds      = stock_df['Close'].values[-3:]
-  c_l2d       = stock_df['Close'].values[-2]
-  c_l1d       = stock_df['Close'].values[-1]
-  c_l1d_60ma  = stock_df['MA 60'].values[-1]
-  c_l2d_60ma  = stock_df['MA 60'].values[-2]
-  c_l1d_200ma = stock_df['MA 200'].values[-1]
-  c_l2d_200ma = stock_df['MA 200'].values[-2]
-
-  v_l2d      = stock_df['Volume'].values[-2]
-  v_l1d      = stock_df['Volume'].values[-1]
-  v_l1d_ma20 = stock_df['Vol MA 20'].values[-1]
-
-  o_l1d = stock_df['Open'].values[-1]
-
-  k_l2d = stock_df['Slow K'].values[-2]
-  k_l1d = stock_df['Slow K'].values[-1]
-  d_l2d = stock_df['Slow D'].values[-2]
-  d_l1d = stock_df['Slow D'].values[-1]
-
-  k_l2w = stock_df_w['Slow K'].values[-2]
-  k_l1w = stock_df_w['Slow K'].values[-1]
-  d_l2w = stock_df_w['Slow D'].values[-2]
-  d_l1w = stock_df_w['Slow D'].values[-1]
-
-  k_l3ms = stock_df_m['Slow K'].values[-3:]
-  k_l2m  = stock_df_m['Slow K'].values[-2]
-  k_l1m  = stock_df_m['Slow K'].values[-1]
-  d_l2m  = stock_df_m['Slow D'].values[-2]
-  d_l1m  = stock_df_m['Slow D'].values[-1]
-
-  r_l2d = stock_df['RSI 14'].values[-2]
-  r_l1d = stock_df['RSI 14'].values[-1]
-  r_l2w = stock_df_w['RSI 14'].values[-2]
-  r_l1w = stock_df_w['RSI 14'].values[-1]
-
-  # Buy
-  if c_l1d < stock['priceFloor']:              buy.append('低於買點')
-  if (k_l2d <= d_l2d) and (k_l1d > d_l1d):   buy.append('日KD黃金交叉')
-  if (k_l2w <= d_l2w) and (k_l1w > d_l1w):   buy.append('週KD黃金交叉')
-  if (k_l2m <= d_l2m) and (k_l1m > d_l1m):   buy.append('月KD黃金交叉')
-  if (k_l2d <= k_l1w) and (k_l1d > k_l1w):   buy.append('日K大於週K')
-  if (k_l2w <= k_l1m) and (k_l1w > k_l1m):   buy.append('週K大於月K')
-  if (k_l1d < 20) and (k_l2d >= 20):          buy.append('日KD小於20')
-  if (k_l1w < 20) and (k_l2w >= 20):          buy.append('週KD小於20')
-  if (k_l1d < 20) and (k_l1w < 20):           buy.append('日週K小於20')
-  if (r_l1d < 30) and (r_l2d >= 30):          buy.append('日RSI小於30')
-  if (r_l1w < 30) and (r_l2w >= 30):          buy.append('週RSI小於30')
-  if (v_l1d > 1.5*v_l2d) and (c_l1d > o_l1d):          buy.append('量大收紅')
-  if _math_strictly_increasing(c_l3ds):                  buy.append('三日均價由下往上')
-  if (v_l1d < 0.5*v_l2d) and (c_l1d > c_l2d):          buy.append('量縮價不跌')
-  if c_l3ds.mean() > c_l6ds.mean():                      buy.append('三日均價大於六日均價')
-  if (c_l1d > c_l1d_60ma)  and (c_l2d <= c_l2d_60ma):  buy.append('漲破季線')
-  if (c_l1d > c_l1d_200ma) and (c_l2d <= c_l2d_200ma): buy.append('漲破200MA')
-
-  # Sell
-  if c_l1d > stock['priceCeiling']:             sell.append('高於賣點')
-  if (k_l2d >= d_l2d) and (k_l1d < d_l1d):    sell.append('日KD死亡交叉')
-  if (k_l2w >= d_l2w) and (k_l1w < d_l1w):    sell.append('週KD死亡交叉')
-  if (k_l2m >= d_l2m) and (k_l1m < d_l1m):    sell.append('月KD死亡交叉')
-  if (k_l2d >= k_l1w) and (k_l1d < k_l1w):    buy.append('日K小於週K')
-  if (k_l2w >= k_l1m) and (k_l1w < k_l1m):    buy.append('週K小於月K')
-  if (k_l1d > 80) and (k_l2d <= 80):           buy.append('日KD大於80')
-  if (k_l1w > 80) and (k_l2w <= 80):           buy.append('週KD大於80')
-  if (k_l1d > 80) and (k_l1w > 80):            buy.append('日週K大於80')
-  if (r_l1d > 70) and (r_l2d <= 70):           sell.append('日RSI大於70')
-  if (r_l1w > 70) and (r_l2w <= 70):           sell.append('週RSI大於70')
-  if (v_l1d > 1.5*v_l2d) and (c_l1d <= o_l1d):         sell.append('量大收黑')
-  if _math_strictly_decreasing(c_l3ds):                  sell.append('三日均價由上往下')
-  if (v_l1d > 1.5*v_l2d) and (c_l1d < c_l2d):          sell.append('量漲價跌')
-  if c_l3ds.mean() < c_l6ds.mean():                      sell.append('三日均價小於六日均價')
-  if (c_l1d < c_l1d_60ma)  and (c_l2d >= c_l2d_60ma):  sell.append('跌破季線')
-  if (c_l1d < c_l1d_200ma) and (c_l2d >= c_l2d_200ma): sell.append('跌破200MA')
-
-  # Other
-  if v_l1d > v_l1d_ma20 * 1.5:             other.append('日線爆大量')
-  if v_l1d < v_l1d_ma20 * 0.5:             other.append('日線縮小量')
-  if _math_strictly_increasing(k_l3ms):    other.append('三月KD由下往上')
-  if _math_strictly_decreasing(k_l3ms):    other.append('三月KD由上往下')
-
-  lines = []
-  if buy:   lines.append('[BUY]  : ' + ' | '.join(buy))
-  if sell:  lines.append('[SELL] : ' + ' | '.join(sell))
-  if other: lines.append('[OTHER]: ' + ' | '.join(other))
-  return lines
-
-
-def _critical_points_after(stock_df, stock_df_w):
-  """Port of stock_check_critical_points_after_resample.
-  stock_df_w / stock_df_m must be resampled to daily (same integer index as stock_df).
-  Returns (dates_list, notes):
-    dates_list: list of [i, tag] — i is integer index into stock_df / dates[]
-      Tags: UL=KD-buy  DL=KD-sell  UM=MACD-buy  DM=MACD-sell
-            UP=general-buy  DP=general-sell  OP=BB-squeeze
-    notes: list of critical note strings for today
-  """
-  notes     = []
-  dates_list = []
-  today_idx  = len(stock_df.index) - 1
-
-  for i in range(20, len(stock_df['Slow K'])):
-    # KD buy: weekly KD golden cross at oversold
-    if (stock_df_w['Slow K'][i] >= stock_df_w['Slow D'][i]) and (stock_df_w['Slow K'][i-1] < stock_df_w['Slow D'][i-1]) \
-      and (stock_df_w['Slow K'][i] < 20) and (stock_df_w['Slow D'][i] < 20):
-      dates_list.append([i, 'UL'])
-      if i == today_idx: notes.append('[KD-CRS]: 買點-週K上穿週D')
-
-    # KD buy: combined KD golden cross at oversold
-    if (stock_df['Combined K'][i] >= stock_df['Combined D'][i]) and (stock_df['Combined K'][i-1] < stock_df['Combined D'][i-1]) \
-      and (stock_df['Combined K'][i] < 20) and (stock_df['Combined D'][i] < 20):
-      dates_list.append([i, 'UL'])
-      if i == today_idx: notes.append('[KD-CRS]: 買點-合K上穿合D')
-
-    # KD sell: weekly KD death cross at overbought
-    if (stock_df_w['Slow K'][i] <= stock_df_w['Slow D'][i]) and (stock_df_w['Slow K'][i-1] > stock_df_w['Slow D'][i-1]) \
-      and (stock_df_w['Slow K'][i] > 80) and (stock_df_w['Slow D'][i] > 80):
-      dates_list.append([i, 'DL'])
-      if i == today_idx: notes.append('[KD-CRS]: 賣點-週K下穿週D')
-
-    # KD sell: combined KD death cross at overbought
-    if (stock_df['Combined K'][i] <= stock_df['Combined D'][i]) and (stock_df['Combined K'][i-1] > stock_df['Combined D'][i-1]) \
-      and (stock_df['Combined K'][i] > 80) and (stock_df['Combined D'][i] > 80):
-      dates_list.append([i, 'DL'])
-      if i == today_idx: notes.append('[KD-CRS]: 賣點-合K下穿合D')
-
-    # MACD week zero-crossing up
-    if (stock_df_w['MACD Hist'][i] >= 0) and (stock_df_w['MACD Hist'][i-1] < 0) \
-      and (stock_df_w['MACD Hist'][i-1] > stock_df_w['MACD Hist'][i-5]):
-      dates_list.append([i, 'UM'])
-      if i == today_idx: notes.append('[MACD-CRS]: 週上穿')
-
-    # MACD week zero-crossing down
-    if (stock_df_w['MACD Hist'][i] < 0) and (stock_df_w['MACD Hist'][i-1] >= 0) \
-      and (stock_df_w['MACD Hist'][i-1] < stock_df_w['MACD Hist'][i-5]):
-      dates_list.append([i, 'DM'])
-      if i == today_idx: notes.append('[MACD-CRS]: 週下穿')
-
-  # MACD week local extrema
-  macd_l = argrelextrema(stock_df_w['MACD Hist'].values, np.less,    order=20)[0]
-  for i in macd_l:
-    dates_list.append([int(i), 'UM'])
-    if i == today_idx: notes.append('[MACD-W]: 買點-週低點')
-
-  macd_h = argrelextrema(stock_df_w['MACD Hist'].values, np.greater, order=20)[0]
-  for i in macd_h:
-    dates_list.append([int(i), 'DM'])
-    if i == today_idx: notes.append('[MACD-W]: 賣點-週高點')
-
-  # MA 200 Diff local extrema
-  ma200_std = stock_df['MA 200 Diff'].std()
-  for i in argrelextrema(stock_df['MA 200 Diff'].values, np.less,    order=20)[0]:
-    if stock_df['MA 200 Diff'][i] < ma200_std * (-1):
-      dates_list.append([int(i), 'UP'])
-  for i in argrelextrema(stock_df['MA 200 Diff'].values, np.greater, order=20)[0]:
-    if stock_df['MA 200 Diff'][i] > ma200_std:
-      dates_list.append([int(i), 'DP'])
-
-  # BB contraction
-  idx_bb = argrelextrema((stock_df['BB Upper'] - stock_df['BB Lower']).values, np.less, order=20)[0]
-  for i in idx_bb:
-    dates_list.append([int(i), 'BB'])
-  if (len(idx_bb) > 0) and (idx_bb[-1] > today_idx - 3):
-    notes.append('[BB]: ' + ('賣點-收縮向下' if stock_df['MA 60'][idx_bb[-1]] >= stock_df['MA 60'][today_idx] else '買點-收縮向上'))
-
-  # All long MAs turn direction together
-  if (stock_df['MA 60'][today_idx] > stock_df['MA 60'][today_idx-1]) \
-    and (stock_df['MA 150'][today_idx] > stock_df['MA 150'][today_idx-1]) \
-    and (stock_df['MA 200'][today_idx] > stock_df['MA 200'][today_idx-1]) \
-    and ((stock_df['MA 60'][today_idx-1]  < stock_df['MA 60'][today_idx-2])
-      or (stock_df['MA 150'][today_idx-1] < stock_df['MA 150'][today_idx-2])
-      or (stock_df['MA 200'][today_idx-1] < stock_df['MA 200'][today_idx-2])):
-    dates_list.append([today_idx, 'UP'])
-    notes.append('[MA-ALL]: 買點-長均線全上彎')
-
-  if (stock_df['MA 60'][today_idx] < stock_df['MA 60'][today_idx-1]) \
-    and (stock_df['MA 150'][today_idx] < stock_df['MA 150'][today_idx-1]) \
-    and (stock_df['MA 200'][today_idx] < stock_df['MA 200'][today_idx-1]) \
-    and ((stock_df['MA 60'][today_idx-1]  > stock_df['MA 60'][today_idx-2])
-      or (stock_df['MA 150'][today_idx-1] > stock_df['MA 150'][today_idx-2])
-      or (stock_df['MA 200'][today_idx-1] > stock_df['MA 200'][today_idx-2])):
-    dates_list.append([today_idx, 'DP'])
-    notes.append('[MA-ALL]: 賣點-長均線全下彎')
-
-  # MA crossings (today only)
-  _ma_cross = [
-    ('Close', 'MA 60',  '買點 Close > MA 60',  '賣點 Close < MA 60'),
-    ('Close', 'MA 150', '買點 Close > MA 150', '賣點 Close < MA 150'),
-    ('Close', 'MA 200', '買點 Close > MA 200', '賣點 Close < MA 200'),
-    ('MA 60',  'MA 150', '買點 MA 60 > MA 150', '賣點 MA 60 < MA 150'),
-    ('MA 60',  'MA 200', '買點 MA 60 > MA 200', '賣點 MA 60 < MA 200'),
-    ('MA 150', 'MA 200', '買點 MA 150 > MA 200','賣點 MA 150 < MA 200'),
-  ]
-  for col_a, col_b, lbl_buy, lbl_sell in _ma_cross:
-    if stock_df[col_a].iloc[today_idx] > stock_df[col_b].iloc[today_idx] \
-      and stock_df[col_a].iloc[today_idx-1] < stock_df[col_b].iloc[today_idx-1]:
-      notes.append(f'[MA-CRS]: {lbl_buy}')
-    if stock_df[col_a].iloc[today_idx] < stock_df[col_b].iloc[today_idx] \
-      and stock_df[col_a].iloc[today_idx-1] > stock_df[col_b].iloc[today_idx-1]:
-      notes.append(f'[MA-CRS]: {lbl_sell}')
-
-  # Volume
-  if   stock_df['Volume'].iloc[-1] > stock_df['Vol MA 20'].iloc[-1] + 2*stock_df['Vol MA 20'].std():
-    notes.append('[VOL]: 極大量')
-  elif stock_df['Volume'].iloc[-1] < stock_df['Vol MA 20'].iloc[-1] * 0.382:
-    notes.append('[VOL]: 極小量')
-
-  # Candlestick patterns (last 20 bars)
-  _o, _h, _l, _c = stock_df['Open'][-20:], stock_df['High'][-20:], stock_df['Low'][-20:], stock_df['Close'][-20:]
-  if talib.CDL3WHITESOLDIERS(_o, _h, _l, _c).iloc[-1] != 0: notes.append('[K-TYPE]: 買點 三紅K')
-  if talib.CDL3BLACKCROWS(_o, _h, _l, _c).iloc[-1]    != 0: notes.append('[K-TYPE]: 賣點 三綠K')
-  _cdl = talib.CDLTRISTAR(_o, _h, _l, _c).iloc[-1]
-  if _cdl != 0: notes.append('[K-TYPE]: ' + ('買點 三星' if _cdl > 0 else '賣點 三星'))
-  if talib.CDLMORNINGSTAR(_o, _h, _l, _c).iloc[-1] != 0: notes.append('[K-TYPE]: 買點 晨星')
-  if talib.CDLEVENINGSTAR(_o, _h, _l, _c).iloc[-1] != 0: notes.append('[K-TYPE]: 賣點 暮星')
-
-  return dates_list, notes
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AR(2) Regime Detection (ported from TradingView/regime.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-AR_WINDOWS = [50, 100, 200, 500]
-MOD_PCT_THRESHOLD = 0.003
-CONFIDENCE_BANDWIDTH = 0.04
-FORWARD_BARS = [5, 10, 20]
-OSC_DIVERGENT = 1.03
-OSC_SUSTAINED = 0.97
-TREND_EXPLOSIVE = 1.03
-TREND_HEALTHY = 0.95
-
-REGIME_DISPLAY = {
-    'divergent_osc': '\U0001f4a5 發散震盪',
-    'sustained_osc': '\U0001f504 持續震盪',
-    'convergent_osc': '\U0001f3af 收斂震盪',
-    'explosive_trend': '⚡ 爆發趨勢',
-    'healthy_trend': '✅ 健康趨勢',
-    'mean_reversion': '↩ 均值回歸',
-    'insufficient': '⛔ 資料不足',
-}
-
-REGIME_COLORS = {
-    'divergent_osc': '#FF0000',
-    'sustained_osc': '#00CED1',
-    'convergent_osc': '#FFD700',
-    'explosive_trend': '#FF8C00',
-    'healthy_trend': '#00FF7F',
-    'mean_reversion': '#808080',
-    'insufficient': '#404040',
-}
-
-REGIME_SUB_DISPLAY = {
-    'divergent_osc_rising':  ('\U0001f4a5 發散震盪(加速)', '立即清倉，遠離市場'),
-    'divergent_osc_flat':    ('\U0001f4a5 發散震盪(僵持)', '空手觀望，勿輕舉妄動'),
-    'divergent_osc_falling': ('\U0001f4a5 發散震盪(趨緩)', '繼續觀望，等待穿越1.03'),
-    'sustained_osc_rising':  ('\U0001f504 持續震盪(轉熱)', '縮小倉位，警戒突破方向'),
-    'sustained_osc_flat':    ('\U0001f504 持續震盪(標準)', '標準區間高拋低吸'),
-    'sustained_osc_falling': ('\U0001f504 持續震盪(轉冷)', '縮停損，等待收斂突破'),
-    'convergent_osc_rising_up':      ('\U0001f3af 收斂震盪(蓄力峰) ▲偏多', '突破在即，備好多單條件單'),
-    'convergent_osc_rising_dn':      ('\U0001f3af 收斂震盪(蓄力峰) ▼偏空', '突破在即，備好空單條件單'),
-    'convergent_osc_rising_unclear': ('\U0001f3af 收斂震盪(蓄力峰) ❓方向未定', '突破在即，等方向確認'),
-    'convergent_osc_flat_up':        ('\U0001f3af 收斂震盪(持續壓縮) ▲偏多', '持續壓縮，等待放量向上突破'),
-    'convergent_osc_flat_dn':        ('\U0001f3af 收斂震盪(持續壓縮) ▼偏空', '持續壓縮，等待放量向下突破'),
-    'convergent_osc_flat_unclear':   ('\U0001f3af 收斂震盪(持續壓縮) ❓方向未定', '持續壓縮，等待放量突破'),
-    'convergent_osc_falling_up':     ('\U0001f3af 收斂震盪(急速收斂) ▲偏多', '突破窗口縮短，備好多單'),
-    'convergent_osc_falling_dn':     ('\U0001f3af 收斂震盪(急速收斂) ▼偏空', '突破窗口縮短，備好空單'),
-    'convergent_osc_falling_unclear':('\U0001f3af 收斂震盪(急速收斂) ❓方向未定', '突破窗口縮短，提高警覺'),
-    'explosive_trend_rising':  ('⚡ 爆發趨勢(加速)', '持倉勿動，移動停損跟緊'),
-    'explosive_trend_flat':    ('⚡ 爆發趨勢(巡航)', '持倉，移動停損正常跟隨'),
-    'explosive_trend_falling': ('⚡ 爆發趨勢(降溫)', '開始減倉1/3，上移停損'),
-    'healthy_trend_rising':    ('✅ 健康趨勢(加速)', '可加碼，停損移至成本'),
-    'healthy_trend_flat':      ('✅ 健康趨勢(標準)', '重倉順勢，回調加碼'),
-    'healthy_trend_falling':   ('✅ 健康趨勢(鬆動)', '減倉至半倉，停損收緊'),
-    'mean_reversion_breakout_up':     ('⭐▲ 蓄力向上突破', '積極布局多單'),
-    'mean_reversion_breakout_dn':     ('⭐▼ 蓄力向下突破', '積極布局空單'),
-    'mean_reversion_unclear':         ('⭐❓ 蓄力方向未定', '觀望等均線方向確認'),
-    'mean_reversion_flat':            ('⏸ 低位盤整盤', '觀望，等模數方向確認'),
-    'mean_reversion_exhaustion_bear': ('\U0001f480▼ 空方動能衰竭', '逆勢輕倉或空手'),
-    'mean_reversion_exhaustion_bull': ('\U0001f480▲ 多方動能衰竭', '逆勢輕倉或空手'),
-    'mean_reversion_decay':           ('↩ 動能衰竭盤', '逆勢輕倉或空手'),
-    'insufficient':                   ('⛔ 資料不足', '禁止交易'),
-}
-
-REGIME_STRENGTH = {
-    'explosive_trend_rising': 1.0, 'explosive_trend_flat': 0.8, 'explosive_trend_falling': 0.4,
-    'healthy_trend_rising': 0.9, 'healthy_trend_flat': 0.7, 'healthy_trend_falling': 0.3,
-    'mean_reversion_breakout_up': 0.8, 'mean_reversion_breakout_dn': 0.8,
-    'mean_reversion_unclear': 0.0, 'mean_reversion_flat': 0.0,
-    'mean_reversion_exhaustion_bear': 0.5, 'mean_reversion_exhaustion_bull': 0.5,
-    'mean_reversion_decay': 0.0,
-    'convergent_osc_rising_up': 0.6, 'convergent_osc_rising_dn': 0.6, 'convergent_osc_rising_unclear': 0.0,
-    'convergent_osc_flat_up': 0.3, 'convergent_osc_flat_dn': 0.3, 'convergent_osc_flat_unclear': 0.0,
-    'convergent_osc_falling_up': 0.2, 'convergent_osc_falling_dn': 0.2, 'convergent_osc_falling_unclear': 0.0,
-    'sustained_osc_rising': 0.0, 'sustained_osc_flat': 0.0, 'sustained_osc_falling': 0.0,
-    'divergent_osc_rising': 0.0, 'divergent_osc_flat': 0.0, 'divergent_osc_falling': 0.0,
-    'insufficient': 0.0,
-}
-
-
-def regime_kalman_filter(close, R=10.0, Q1=0.01, Q2=0.01):
-    n = len(close)
-    kf_x = np.full(n, np.nan)
-    kf_v = np.full(n, np.nan)
-    x, vel = close[0], 0.0
-    p11, p12, p21, p22 = 1.0, 0.0, 0.0, 1.0
-    kf_x[0], kf_v[0] = x, vel
-    for i in range(1, n):
-        if np.isnan(close[i]):
-            kf_x[i], kf_v[i] = x, vel
-            continue
-        x_p = x + vel
-        v_p = vel
-        p11_p = p11 + p12 + p21 + p22 + Q1
-        p12_p = p12 + p22
-        p21_p = p21 + p22
-        p22_p = p22 + Q2
-        y = close[i] - x_p
-        S = max(p11_p + R, 1e-10)
-        K1, K2 = p11_p / S, p21_p / S
-        x = x_p + K1 * y
-        vel = v_p + K2 * y
-        IK1 = 1.0 - K1
-        p11 = max(IK1 * IK1 * p11_p + K1 * K1 * R, 1e-9)
-        p12 = IK1 * (p12_p - K2 * p11_p) + K1 * K2 * R
-        p21 = p12
-        p22 = max(K2 * K2 * p11_p - K2 * p21_p - K2 * p12_p + p22_p + K2 * K2 * R, 1e-9)
-        kf_x[i], kf_v[i] = x, vel
-    return kf_x, kf_v
-
-
-def regime_ar2_fit(log_returns, window):
-    r = log_returns.fillna(0.0)
-    r1 = r.shift(1).fillna(0.0)
-    r2 = r.shift(2).fillna(0.0)
-    s11 = (r1 * r1).rolling(window).sum()
-    s12 = (r1 * r2).rolling(window).sum()
-    s22 = (r2 * r2).rolling(window).sum()
-    s10 = (r1 * r).rolling(window).sum()
-    s20 = (r2 * r).rolling(window).sum()
-    det = s11 * s22 - s12 ** 2
-    trace = s11 + s22
-    cond = trace / (det.abs() + 1e-15)
-    stable = (det.abs() > 1e-12) & (cond < 1e8)
-    result = pd.DataFrame(index=log_returns.index)
-    result['a1'] = np.where(stable, (s22 * s10 - s12 * s20) / det, np.nan)
-    result['a2'] = np.where(stable, (s11 * s20 - s12 * s10) / det, np.nan)
-    result['cond_number'] = np.where(stable, cond, np.nan)
-    result.iloc[:window + 2] = np.nan
-    return result
-
-
-def regime_ar2_eigenvalues(a1, a2):
-    disc = a1 ** 2 + 4.0 * a2
-    valid = ~np.isnan(disc)
-    has_real = valid & (disc >= 0)
-    has_complex = valid & (disc < 0)
-    sqrt_d = np.where(has_real, np.sqrt(np.maximum(disc, 0)), 0)
-    z1 = np.where(has_real, (a1 + sqrt_d) / 2.0, np.nan)
-    z2 = np.where(has_real, (a1 - sqrt_d) / 2.0, np.nan)
-    z1_mod, z2_mod = np.abs(z1), np.abs(z2)
-    real_dom_mod = np.where(has_real, np.maximum(z1_mod, z2_mod), np.nan)
-    dom_z = np.where(z1_mod >= z2_mod, z1, z2)
-    neg_root = has_real & (dom_z < 0)
-    cmod = np.where(has_complex, np.sqrt(np.abs(a2)), np.nan)
-    imag = np.where(has_complex, np.sqrt(np.maximum(-disc, 0)), 0)
-    carg = np.where(has_complex, np.arctan2(imag, a1), np.nan)
-    cycle = np.where(has_complex & (np.abs(carg) > 1e-9), (2 * np.pi) / carg, np.nan)
-    damp = np.where(has_complex & (cmod > 1e-9), -np.log(np.maximum(cmod, 1e-15)), np.nan)
-    dom_mod = np.where(has_real, real_dom_mod, np.where(has_complex, cmod, np.nan))
-    return dict(disc=disc, has_real=has_real, has_complex=has_complex,
-                real_dominant_mod=real_dom_mod, dominant_z=dom_z,
-                real_root_negative=neg_root, complex_mod=cmod,
-                cycle_period=cycle, damping_ratio=damp, dominant_mod=dom_mod)
-
-
-def regime_multi_window_ar2(log_returns, windows=None):
-    if windows is None:
-        windows = AR_WINDOWS
-    n = len(log_returns)
-    all_mods, all_weights, all_root_types = [], [], []
-    per_window = {}
-    for w in windows:
-        if w + 2 >= n:
-            continue
-        ar = regime_ar2_fit(log_returns, w)
-        eig = regime_ar2_eigenvalues(ar['a1'].values, ar['a2'].values)
-        weight = np.where(np.isnan(ar['cond_number'].values), 0, 1.0 / (ar['cond_number'].values + 1.0))
-        rt = np.full(n, -1)
-        rt[eig['real_root_negative']] = 2
-        rt[eig['has_real'] & ~eig['real_root_negative']] = 0
-        rt[eig['has_complex']] = 1
-        all_mods.append(eig['dominant_mod'])
-        all_weights.append(weight)
-        all_root_types.append(rt)
-        per_window[w] = dict(ar=ar, eig=eig, weight=weight)
-    if not all_mods:
-        raise ValueError("Not enough data for any AR window")
-    mods = np.array(all_mods)
-    weights = np.array(all_weights)
-    root_types = np.array(all_root_types)
-    valid = ~np.isnan(mods) & (weights > 0)
-    w_sum = np.where(valid, weights, 0).sum(axis=0)
-    w_mod = np.where(valid, weights * mods, 0).sum(axis=0)
-    consensus_mod = np.where(w_sum > 0, w_mod / w_sum, np.nan)
-    vote_counts = np.zeros((n, 3))
-    for j in range(len(all_mods)):
-        for rt in range(3):
-            mask = valid[j] & (root_types[j] == rt)
-            vote_counts[mask, rt] += weights[j][mask]
-    total_w = vote_counts.sum(axis=1)
-    consensus_rt = np.where(total_w > 0, np.argmax(vote_counts, axis=1), -1)
-    agreement = np.where(total_w > 0, vote_counts.max(axis=1) / total_w, 0)
-    cp_list = [per_window[w]['eig']['cycle_period'] for w in per_window]
-    cw_list = [per_window[w]['weight'] for w in per_window]
-    if cp_list:
-        cp_arr, cw_arr = np.array(cp_list), np.array(cw_list)
-        cp_v = ~np.isnan(cp_arr) & (cw_arr > 0)
-        cw_s = np.where(cp_v, cw_arr, 0).sum(axis=0)
-        cp_s = np.where(cp_v, cw_arr * cp_arr, 0).sum(axis=0)
-        cons_cycle = np.where(cw_s > 0, cp_s / cw_s, np.nan)
-    else:
-        cons_cycle = np.full(n, np.nan)
-    dr_list = [per_window[w]['eig']['damping_ratio'] for w in per_window]
-    dw_list = [per_window[w]['weight'] for w in per_window]
-    if dr_list:
-        dr_arr, dw_arr = np.array(dr_list), np.array(dw_list)
-        dr_v = ~np.isnan(dr_arr) & (dw_arr > 0)
-        dw_s = np.where(dr_v, dw_arr, 0).sum(axis=0)
-        dr_s = np.where(dr_v, dw_arr * dr_arr, 0).sum(axis=0)
-        cons_damp = np.where(dw_s > 0, dr_s / dw_s, np.nan)
-    else:
-        cons_damp = np.full(n, np.nan)
-    result = pd.DataFrame(index=log_returns.index)
-    result['dominant_mod'] = consensus_mod
-    result['root_type'] = consensus_rt
-    result['is_real_positive'] = consensus_rt == 0
-    result['is_complex'] = consensus_rt == 1
-    result['is_real_negative'] = consensus_rt == 2
-    result['cycle_period'] = cons_cycle
-    result['damping_ratio'] = cons_damp
-    result['agreement'] = agreement
-    result['n_valid_windows'] = valid.sum(axis=0)
-    primary_w = 200 if 200 in per_window else (list(per_window.keys())[0] if per_window else None)
-    if primary_w is not None:
-        result['a1'] = per_window[primary_w]['ar']['a1'].values
-        result['a2'] = per_window[primary_w]['ar']['a2'].values
-    else:
-        result['a1'] = np.nan
-        result['a2'] = np.nan
-    return result, per_window
-
-
-def regime_classify(df):
-    n = len(df)
-    mod = df['dominant_mod'].values
-    is_rp = df['is_real_positive'].values
-    is_cx = df['is_complex'].values
-    is_rn = df['is_real_negative'].values
-    kf_v = df['KF_Velocity'].values
-    close = df['Close'].values
-    ma20 = df['MA20'].values
-    ma60 = df['MA60'].values
-    zscore = df['Z_Score'].values
-    agreement = df['agreement'].values
-    mod_change = np.full(n, np.nan)
-    mod_pct_change = np.full(n, np.nan)
-    for i in range(1, n):
-        if not np.isnan(mod[i]) and not np.isnan(mod[i - 1]):
-            mod_change[i] = mod[i] - mod[i - 1]
-            if mod[i] > 1e-6:
-                mod_pct_change[i] = mod_change[i] / mod[i]
-    mod_rising = np.zeros(n, dtype=bool)
-    mod_falling = np.zeros(n, dtype=bool)
-    for i in range(2, n):
-        if not np.isnan(mod_pct_change[i]) and not np.isnan(mod[i - 2]):
-            if mod_pct_change[i] > MOD_PCT_THRESHOLD and mod[i] > mod[i - 2]:
-                mod_rising[i] = True
-            elif mod_pct_change[i] < -MOD_PCT_THRESHOLD and mod[i] < mod[i - 2]:
-                mod_falling[i] = True
-    mod_flat = ~mod_rising & ~mod_falling
-    osc_dir_up = (~np.isnan(kf_v) & (kf_v > 0) & ~np.isnan(ma20) & ~np.isnan(ma60) &
-                  (close > ma60) & (ma20 > ma60))
-    osc_dir_dn = (~np.isnan(kf_v) & (kf_v < 0) & ~np.isnan(ma20) & ~np.isnan(ma60) &
-                  (close < ma60) & (ma20 < ma60))
-    breakout_up = (is_rp & ~np.isnan(mod) & (mod < TREND_HEALTHY) &
-                   mod_rising & ~np.isnan(kf_v) & (kf_v > 0) &
-                   ~np.isnan(ma20) & ~np.isnan(ma60) &
-                   (close > ma60) & (ma20 > ma60) &
-                   ~np.isnan(zscore) & (zscore > -2.0) & (zscore < 1.5))
-    breakout_dn = (is_rp & ~np.isnan(mod) & (mod < TREND_HEALTHY) &
-                   mod_rising & ~np.isnan(kf_v) & (kf_v < 0) &
-                   ~np.isnan(ma20) & ~np.isnan(ma60) &
-                   (close < ma60) & (ma20 < ma60) &
-                   ~np.isnan(zscore) & (zscore < 2.0) & (zscore > -1.5))
-    mod_s3 = np.concatenate([np.full(3, np.nan), mod[:-3]])
-    exhaustion_base = (is_rp & ~np.isnan(mod) & (mod < TREND_HEALTHY) &
-                       ~np.isnan(mod_s3) & (mod_s3 >= TREND_HEALTHY) & mod_falling)
-    exhaustion_bear = exhaustion_base & ~np.isnan(kf_v) & (kf_v < 0)
-    exhaustion_bull = exhaustion_base & ~np.isnan(kf_v) & (kf_v > 0)
-    confidence = np.full(n, np.nan)
-    for i in range(n):
-        if not np.isnan(mod[i]):
-            nearest = min(abs(mod[i] - OSC_SUSTAINED), abs(mod[i] - TREND_HEALTHY), abs(mod[i] - OSC_DIVERGENT))
-            boundary_conf = min(nearest / CONFIDENCE_BANDWIDTH, 1.0) * 100.0
-            ag = agreement[i] if not np.isnan(agreement[i]) else 0.5
-            confidence[i] = boundary_conf * ag
-    labels, subs, directions = [], [], []
-    for i in range(n):
-        m = mod[i]
-        if np.isnan(m):
-            labels.append('insufficient'); subs.append('insufficient'); directions.append(0)
-            continue
-        if is_cx[i] or is_rn[i]:
-            if m > OSC_DIVERGENT:
-                base = 'divergent_osc'
-                sub = f'divergent_osc_{"rising" if mod_rising[i] else ("falling" if mod_falling[i] else "flat")}'
-                d = 0
-            elif m >= OSC_SUSTAINED:
-                base = 'sustained_osc'
-                sub = f'sustained_osc_{"rising" if mod_rising[i] else ("falling" if mod_falling[i] else "flat")}'
-                d = 0
-            else:
-                base = 'convergent_osc'
-                dtag = 'up' if osc_dir_up[i] else ('dn' if osc_dir_dn[i] else 'unclear')
-                d = 1 if osc_dir_up[i] else (-1 if osc_dir_dn[i] else 0)
-                mtag = 'rising' if mod_rising[i] else ('falling' if mod_falling[i] else 'flat')
-                sub = f'convergent_osc_{mtag}_{dtag}'
-            labels.append(base); subs.append(sub); directions.append(d)
-        elif is_rp[i]:
-            if m > TREND_EXPLOSIVE:
-                base = 'explosive_trend'
-                mtag = 'rising' if mod_rising[i] else ('falling' if mod_falling[i] else 'flat')
-                sub = f'explosive_trend_{mtag}'
-                d = 1 if (not np.isnan(kf_v[i]) and kf_v[i] > 0) else (-1 if (not np.isnan(kf_v[i]) and kf_v[i] < 0) else 0)
-            elif m >= TREND_HEALTHY:
-                base = 'healthy_trend'
-                mtag = 'rising' if mod_rising[i] else ('falling' if mod_falling[i] else 'flat')
-                sub = f'healthy_trend_{mtag}'
-                d = 1 if (not np.isnan(kf_v[i]) and kf_v[i] > 0) else (-1 if (not np.isnan(kf_v[i]) and kf_v[i] < 0) else 0)
-            else:
-                base = 'mean_reversion'
-                if mod_rising[i]:
-                    if breakout_up[i]: sub, d = 'mean_reversion_breakout_up', 1
-                    elif breakout_dn[i]: sub, d = 'mean_reversion_breakout_dn', -1
-                    else: sub, d = 'mean_reversion_unclear', 0
-                elif mod_flat[i]:
-                    sub, d = 'mean_reversion_flat', 0
-                else:
-                    if exhaustion_bear[i]: sub, d = 'mean_reversion_exhaustion_bear', -1
-                    elif exhaustion_bull[i]: sub, d = 'mean_reversion_exhaustion_bull', 1
-                    else: sub, d = 'mean_reversion_decay', 0
-            labels.append(base); subs.append(sub); directions.append(d)
-        else:
-            labels.append('insufficient'); subs.append('insufficient'); directions.append(0)
-    df['regime_confidence'] = confidence
-    df['regime_label'] = labels
-    df['regime_sub'] = subs
-    df['regime_direction'] = directions
-    return df
-
-
-def regime_signal_strength(df, base_risk=0.02):
-    kf_v = df['KF_Velocity'].values
-    close = df['Close'].values
-    atr20 = df['ATR20'].values
-    zscore = df['Z_Score'].values
-    confidence = df['regime_confidence'].values
-    direction = np.array(df['regime_direction'].values, dtype=float)
-    sub_list = df['regime_sub'].values
-    ma20 = df['MA20'].values
-    ma60 = df['MA60'].values
-    strength = np.array([REGIME_STRENGTH.get(s, 0.0) for s in sub_list])
-    regime_score = direction * strength
-    kf_score = np.where(~np.isnan(kf_v) & ~np.isnan(atr20) & (atr20 > 0),
-                        np.tanh(kf_v / (atr20 * 0.5)), 0.0)
-    ma_score = np.where((close > ma60) & (ma20 > ma60), 1.0,
-               np.where((close < ma60) & (ma20 < ma60), -1.0, 0.0))
-    z_adj = np.where(np.isnan(zscore), 0.0, np.clip(-zscore * 0.15, -0.3, 0.3))
-    conf_factor = np.where(np.isnan(confidence), 0.0, confidence / 100.0)
-    raw = 0.35 * regime_score + 0.30 * kf_score + 0.20 * ma_score + 0.15 * z_adj
-    df['signal_strength'] = np.clip(raw * conf_factor, -1.0, 1.0)
-    vol_norm = np.where((atr20 > 0) & (close > 0), atr20 / close, np.nan)
-    df['position_pct'] = np.where(~np.isnan(vol_norm) & (vol_norm > 0),
-                                  np.clip(df['signal_strength'].values * base_risk / vol_norm, -1.0, 1.0), 0.0)
-    return df
-
-
-def regime_walk_forward_backtest(df, forward_bars=None):
-    if forward_bars is None:
-        forward_bars = FORWARD_BARS
-    for fb in forward_bars:
-        df[f'fwd_{fb}'] = df['Close'].shift(-fb) / df['Close'] - 1
-    valid = df.dropna(subset=['regime_label'])
-    valid = valid[valid['regime_label'] != 'insufficient']
-    def _stats(subset, fb):
-        col = f'fwd_{fb}'
-        r = subset[col].dropna()
-        if len(r) < 6:
-            return {f'mean_{fb}': np.nan, f'median_{fb}': np.nan, f'win_{fb}': np.nan, f'sharpe_{fb}': np.nan}
-        return {
-            f'mean_{fb}': r.mean() * 100, f'median_{fb}': r.median() * 100,
-            f'win_{fb}': (r > 0).mean() * 100,
-            f'sharpe_{fb}': (r.mean() / r.std() * np.sqrt(252 / fb)) if r.std() > 0 else 0,
-        }
-    rows_main = []
-    for regime in valid['regime_label'].unique():
-        sub = valid[valid['regime_label'] == regime]
-        row = {'regime': regime, 'count': len(sub)}
-        for fb in forward_bars:
-            row.update(_stats(sub, fb))
-        rows_main.append(row)
-    rows_sub = []
-    for sub_name in valid['regime_sub'].unique():
-        sub = valid[valid['regime_sub'] == sub_name]
-        row = {'regime_sub': sub_name, 'count': len(sub)}
-        for fb in forward_bars:
-            row.update(_stats(sub, fb))
-        rows_sub.append(row)
-    bt_main = pd.DataFrame(rows_main).set_index('regime') if rows_main else pd.DataFrame()
-    bt_sub = pd.DataFrame(rows_sub).set_index('regime_sub') if rows_sub else pd.DataFrame()
-    return bt_main, bt_sub
-
-
-def regime_run_full(stock_df):
-    """Run full regime pipeline on stock_df (OHLCV, index may be DatetimeIndex or 'Date' column).
-    Returns (regime_df, bt_main, bt_sub) or (None, empty, empty) on failure."""
-    try:
-        if 'Date' in stock_df.columns:
-            rdf = stock_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
-            rdf.index = pd.to_datetime(rdf['Date'])
-        else:
-            rdf = stock_df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-            rdf.index = pd.to_datetime(rdf.index)
-
-        c = rdf['Close'].values.astype(np.float64)
-        h = rdf['High'].values.astype(np.float64)
-        lo = rdf['Low'].values.astype(np.float64)
-        o = rdf['Open'].values.astype(np.float64)
-
-        for period, name in [(20, 'MA20'), (60, 'MA60')]:
-            rdf[name] = talib.SMA(c, timeperiod=min(period, len(c)))
-        rdf['ATR14'] = talib.ATR(h, lo, c, timeperiod=14)
-        rdf['ATR20'] = talib.ATR(h, lo, c, timeperiod=20)
-        rdf['Log_Return'] = np.log(rdf['Close'] / rdf['Close'].shift(1))
-        lr = rdf['Log_Return']
-        lr_mean = lr.rolling(200).mean()
-        lr_std = lr.rolling(200).std()
-        rdf['Z_Score'] = np.where(lr_std > 0, (lr - lr_mean) / lr_std, np.nan)
-
-        # TD9
-        close_s = rdf['Close']
-        close_4ago = close_s.shift(4)
-        up = (close_s > close_4ago).astype(int)
-        dn = (close_s < close_4ago).astype(int)
-        up_count = np.zeros(len(rdf))
-        dn_count = np.zeros(len(rdf))
-        for i in range(len(rdf)):
-            up_count[i] = (up_count[i - 1] + 1) if (i > 0 and up.iloc[i]) else up.iloc[i]
-            dn_count[i] = (dn_count[i - 1] + 1) if (i > 0 and dn.iloc[i]) else dn.iloc[i]
-        rdf['TD9_Up'] = up_count == 9
-        rdf['TD9_Down'] = dn_count == 9
-
-        # FVG
-        atr14 = rdf['ATR14'].values
-        bullish_fvg = np.zeros(len(rdf), dtype=bool)
-        bearish_fvg = np.zeros(len(rdf), dtype=bool)
-        for i in range(2, len(rdf)):
-            mid_body = abs(c[i - 1] - o[i - 1])
-            mid_range = h[i - 1] - lo[i - 1]
-            if mid_range <= 0 or np.isnan(atr14[i]):
-                continue
-            strong = (mid_body / mid_range) >= 0.7
-            if (h[i - 2] < lo[i] and strong and c[i - 1] > o[i - 1] and
-                    (lo[i] - h[i - 2]) > atr14[i] * 1.2):
-                bullish_fvg[i] = True
-            if (lo[i - 2] > h[i] and strong and c[i - 1] < o[i - 1] and
-                    (lo[i - 2] - h[i]) > atr14[i] * 1.2):
-                bearish_fvg[i] = True
-        rdf['Bullish_FVG'] = bullish_fvg
-        rdf['Bearish_FVG'] = bearish_fvg
-
-        # KF
-        kf_x, kf_v = regime_kalman_filter(c)
-        rdf['KF_Position'] = kf_x
-        rdf['KF_Velocity'] = kf_v
-
-        # AR(2) → classify → signal → backtest
-        ar_result, _ = regime_multi_window_ar2(rdf['Log_Return'])
-        for col in ar_result.columns:
-            rdf[col] = ar_result[col].values
-        rdf = regime_classify(rdf)
-        rdf = regime_signal_strength(rdf)
-        bt_main, bt_sub = regime_walk_forward_backtest(rdf)
-        return rdf, bt_main, bt_sub
-    except Exception as e:
-        print(f'  WARNING: regime analysis failed: {e}')
-        return None, pd.DataFrame(), pd.DataFrame()
-
-
-def regime_build_backtest_html(bt_main, bt_sub, current_label, current_sub):
-    """Build HTML table strings for backtest results."""
-    bt_html = ""
-    if not bt_main.empty:
-        bt_rows = []
-        for rname in bt_main.index:
-            rd = bt_main.loc[rname]
-            display = REGIME_DISPLAY.get(rname, rname)
-            marker = ' ◄' if rname == current_label else ''
-            cells = [f'<td style="text-align:left">{display}{marker}</td>',
-                     f'<td>{int(rd["count"])}</td>']
-            for fb in FORWARD_BARS:
-                m = rd.get(f'mean_{fb}', np.nan)
-                wr = rd.get(f'win_{fb}', np.nan)
-                sh = rd.get(f'sharpe_{fb}', np.nan)
-                if not np.isnan(m):
-                    color = '#00AA55' if m > 0 else '#CC3333'
-                    cells.append(f'<td style="color:{color}">{m:+.2f}%</td>')
-                    cells.append(f'<td>{wr:.0f}%</td>')
-                    cells.append(f'<td>{sh:.2f}</td>')
-                else:
-                    cells.extend(['<td>—</td>'] * 3)
-            bt_rows.append('<tr>' + ''.join(cells) + '</tr>')
-        hdrs = ['<th>Regime</th>', '<th>N</th>']
-        for fb in FORWARD_BARS:
-            hdrs.extend([f'<th>{fb}d Mean</th>', f'<th>{fb}d Win%</th>', f'<th>{fb}d Sharpe</th>'])
-        bt_html = (f'<h2 style="color:#fff;margin-top:30px">Walk-Forward Backtest Results</h2>'
-                   f'<table class="bt"><thead><tr>{"".join(hdrs)}</tr></thead>'
-                   f'<tbody>{"".join(bt_rows)}</tbody></table>')
-
-    sub_html = ""
-    if not bt_sub.empty:
-        sub_rows = []
-        for sname in bt_sub.index:
-            rd = bt_sub.loc[sname]
-            disp, advice = REGIME_SUB_DISPLAY.get(sname, (sname, ''))
-            marker = ' ◄' if sname == current_sub else ''
-            base_label = sname.rsplit('_', 1)[0] if '_' in sname else sname
-            for k in REGIME_COLORS:
-                if sname.startswith(k):
-                    base_label = k
-                    break
-            color_td = REGIME_COLORS.get(base_label, '#ccc') if sname == current_sub else '#ccc'
-            cells = [
-                f'<td style="text-align:left;border-left:3px solid {color_td}">{disp}{marker}</td>',
-                f'<td style="text-align:left;color:#888">{advice}</td>',
-                f'<td>{int(rd["count"])}</td>']
-            for fb in FORWARD_BARS:
-                m = rd.get(f'mean_{fb}', np.nan)
-                wr = rd.get(f'win_{fb}', np.nan)
-                sh = rd.get(f'sharpe_{fb}', np.nan)
-                if not np.isnan(m):
-                    color = '#00AA55' if m > 0 else '#CC3333'
-                    cells.append(f'<td style="color:{color}">{m:+.2f}%</td>')
-                    cells.append(f'<td>{wr:.0f}%</td>')
-                    cells.append(f'<td>{sh:.2f}</td>')
-                else:
-                    cells.extend(['<td>—</td>'] * 3)
-            sub_rows.append('<tr>' + ''.join(cells) + '</tr>')
-        shdrs = ['<th style="text-align:left">Regime Sub-State</th>',
-                  '<th style="text-align:left">Action</th>', '<th>N</th>']
-        for fb in FORWARD_BARS:
-            shdrs.extend([f'<th>{fb}d Mean</th>', f'<th>{fb}d Win%</th>', f'<th>{fb}d Sharpe</th>'])
-        sub_html = (f'<h2 style="color:#fff;margin-top:30px">Detailed Sub-State Backtest</h2>'
-                    f'<table class="bt"><thead><tr>{"".join(shdrs)}</tr></thead>'
-                    f'<tbody>{"".join(sub_rows)}</tbody></table>')
-
-    if not bt_html and not sub_html:
-        return ""
-    table_css = ('<style>'
-                 '.bt{border-collapse:collapse;margin:20px auto;font-size:15px;font-family:"Courier New",monospace;background:#fff}'
-                 '.bt th,.bt td{border:1px solid #ddd;padding:8px 12px;text-align:right;color:#333}'
-                 '.bt th{background:#f5f5f5;color:#222;font-weight:bold}'
-                 '.bt tr:nth-child(even){background:#fafafa}'
-                 '.bt tr:hover{background:#eef6ff}'
-                 '</style>')
-    return f"{table_css}{bt_html}{sub_html}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Main combined chart function
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
-  """
-  整合圖表：將技術指標圖與持倉圖（美股: FINRA/Benzinga short interest,
-  台股: FinLab 三大法人）結合在同一個時間 X 軸上，輸出一個合併的 HTML 圖表。
-
-  Parameters
-  ----------
-  ticker_input : str
-      Yahoo Finance ticker symbol，例如 'AAPL'、'0050.'（台股自動補 .TW/.TWO）。
-  dir : str
-      輸出目錄，預設為目前目錄 '.'。
-  display_days : int
-      顯示天數，預設 365 天。
-  finlab_token : str
-      FinLab API token。提供時用 FinLab 抓台股三大法人/借券/融資券資料；
-      留空（預設）則改用 histock 爬蟲。
-  """
-
-  print(f'[ONE CHART] ------------------------------------------------')
-
-  # ── 0. 準備 ticker ────────────────────────────────────────────────
-  ticker = stock_is_tw_otc(ticker_input).upper()
-  global error_ticker
-  error_ticker = ticker
-  is_tw  = ('.TW' in ticker) or ('^TW' in ticker)
-  is_us  = not is_tw and ('.' not in ticker) and ('^' not in ticker) and ('=' not in ticker)
-
-  stock = {'ticker': ticker, 'description': ticker}
-
-  read_days = display_days + 450
-  today     = datetime.date.today()
-  startDate = today - datetime.timedelta(days=read_days)
-  endDate   = today
-
-  s = requests.Session(impersonate="chrome")
-
-  # ── 1. 取日 K 資料 ────────────────────────────────────────────────
-  print(f'  Fetching OHLCV: {ticker}')
-  try:
-    if is_tw:
-      if datetime.datetime.now().time().hour < 9:
-        stock_df = stock_datareader_cnyes(ticker, startDate, endDate, session=s)
-      else:
-        stock_df = stock_datareader_yahoo(ticker, startDate, endDate, session=s, div_recovered=False)
-    elif '^TW' in ticker:
-      stock_df = stock_datareader_cnyes_index(ticker, startDate, endDate, session=s)
-    else:
-      stock_df = stock_datareader_yahoo(ticker, startDate, endDate, session=s, div_recovered=False)
-  except Exception as e:
-    print_exception(e)
-    return
-
-  if stock_df.empty:
-    print('  ERROR: empty dataframe')
-    return
-
-  # ── 2. 資料清理與 Resample ─────────────────────────────────────────
-  stock_df.dropna(inplace=True)
-  stock_df = stock_df[~stock_df.index.duplicated(keep='first')]
-  stock_df.index = stock_df.index.normalize()
-
-  agg_tw   = {'High': 'max', 'Low': 'min', 'Open': 'first', 'Close': 'last', 'Volume': 'sum'}
-  agg_else = {'High': 'max', 'Low': 'min', 'Open': 'first', 'Close': 'last', 'Volume': 'sum', 'Adj Close': 'last'}
-
-  if is_tw and datetime.datetime.now().time().hour < 9:
-    agg_tw['PE'] = 'last'
-    stock_df_w = stock_df.resample('W-Fri').agg(agg_tw)
-    stock_df_m = stock_df.resample('BME').agg(agg_tw)
-  elif is_tw:
-    agg_tw['Adj Close'] = 'last'
-    stock_df_w = stock_df.resample('W-Fri').agg(agg_tw)
-    stock_df_m = stock_df.resample('BME').agg(agg_tw)
-  else:
-    stock_df_w = stock_df.resample('W-Fri').agg(agg_else)
-    stock_df_m = stock_df.resample('BME').agg(agg_else)
-
-  stock_df_w.dropna(inplace=True)
-  stock_df_m.dropna(inplace=True)
-
-  stock_df.index.names   = ['Date']
-  stock_df_w.index.names = ['Date']
-  stock_df_m.index.names = ['Date']
-
-  # ── 3. talib 計算 ─────────────────────────────────────────────────
-  is_coin = '-USD' in ticker.upper()
-  try:
-    talib_stats_calculation_stock_day(stock_df, is_coin)
-    talib_stats_calculation_stock_week(stock_df_w)
-    talib_stats_calculation_stock(stock_df_m)
-  except Exception as e:
-    print_exception(e)
-    return
-
-  # ── 3b. AR(2) Regime analysis (KF, TD9, FVG, backtest) ───────────
-  print(f'  Running regime analysis...')
-  _regime_df, _regime_bt_main, _regime_bt_sub = regime_run_full(stock_df)
-  if _regime_df is not None:
-    print(f'  Regime: {_regime_df.iloc[-1]["regime_sub"]}')
-
-  # ── 4. Resample 對齊日頻（供 pyecharts panels 使用） ───────────────
-  if 'priceFloor'   not in stock: stock['priceFloor']   = stock_df['Close'].min()
-  if 'priceCeiling' not in stock: stock['priceCeiling'] = stock_df['Close'].max()
-
-  stock_df_w_resample = stock_df_w[['Slow K', 'Slow D', 'CCI', 'RSI 14', 'MACD Hist', 'Mom', 'Work']].reindex(stock_df.index)
-  if stock_df_w_resample.index[-1] < stock_df_w.index[-1]:
-    stock_df_w_resample.iloc[-1] = stock_df_w.iloc[-1][['Slow K', 'Slow D', 'CCI', 'RSI 14', 'MACD Hist', 'Mom', 'Work']]
-  stock_df_w_resample.interpolate(method='linear', limit_direction='backward', inplace=True)
-
-  stock_df_m_resample = stock_df_m[['Slow K', 'Slow D', 'CCI', 'RSI 14']].reindex(stock_df.index)
-  if stock_df_m_resample.index[-1] < stock_df_m.index[-1]:
-    stock_df_m_resample.iloc[-1] = stock_df_m.iloc[-1][['Slow K', 'Slow D', 'CCI', 'RSI 14']]
-  stock_df_m_resample.interpolate(method='linear', limit_direction='backward', inplace=True)
-
-  stock_df.reset_index(inplace=True)
-  stock_df_w_r = stock_df_w_resample.reset_index()
-  stock_df_m_r = stock_df_m_resample.reset_index()
-
-  factor_w = 7 if '-' in ticker else 5
-  factor_m = 30 if '-' in ticker else 20
-  stock_df['Combined K'] = (stock_df['Slow K'] + stock_df_w_r['Slow K']*factor_w + stock_df_m_r['Slow K']*factor_m) / (1+factor_w+factor_m)
-  stock_df['Combined D'] = (stock_df['Slow D'] + stock_df_w_r['Slow D']*factor_w + stock_df_m_r['Slow D']*factor_m) / (1+factor_w+factor_m)
-  #stock_df['RS Score'] = 0
-
-  # ── 4b. Critical points analysis ──────────────────────────────────
-  sig_notes     = []
-  sig_dates_list = []
-  # UL = red triangle below Low (KD buy)
-  # DL = green triangle above High (KD sell)
-  # UM/DM = red/green arrow (MACD signals)
-  # UP/DP = red/green diamond (MA/price signals)
-  # BB = purple circle at midpoint (BB squeeze)
-  try:
-    sig_notes      = _critical_points_before(stock_df, stock_df_w, stock_df_m, stock)
-    dl, sig_after  = _critical_points_after(stock_df, stock_df_w_r)
-    sig_dates_list = dl
-    sig_notes     += sig_after
-    for note in sig_notes:
-      print(f'  {note}')
-  except Exception as e:
-    print(f'  WARNING: critical points analysis failed: {e}')
-
-  dates = [
-    d.strftime('%Y%m%d') if hasattr(d, 'strftime') else str(d)[:10].replace('-', '')
-    for d in stock_df['Date']
-  ]
-
-  # ── 5. 取持倉資料並對齊 stock_df 的日期索引 ───────────────────────
-  df_pos = None
-
-  if is_us:
-    print(f'  Fetching US short interest (Benzinga): {ticker}')
-    try:
-      headers_benzinga = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'zh-TW,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6',
-        'Cache-Control': 'max-age=0',
-        'Connection': 'keep-alive',
-        'Referer': 'https://www.google.com/',
-        'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-      }
-      r = requests.get(f'{si_url}/quote/{ticker}/short-interest',
-                       headers=headers_benzinga, verify=False)
+    
+    params = {
+      'action': 'mf',
+      'count': str(BARS),
+      'id': '2330',
+      'ck': 'ML7EuNTM4B87LWAfCN94XIUVRMUVIHmjrEY^DHVQHBWwCRQrCXC3jMk$5OErz',
+    }
+
+    ck = ''
+    r = requests.get(f'{cm_url}?action=mf&id=2330', headers=headers, verify=False)
+    if r.status_code == 200:
+      idx_b = r.text.index('var ck = "') + 10
+      if idx_b > 0:
+        idx_e = r.text.index('";', idx_b)
+        ck = r.text[idx_b:idx_e]
+        params['ck'] = ck
+        print(f'CK: {ck}')
+    
+    if ck != '':
+      params['id'] = ticker[:ticker.index('.')]
+      r = requests.get(cm_url2, params=params, headers=headers, verify=False)
       if r.status_code == 200:
-        html  = r.text
-        json_txt = None
-
-        # Try old format: "shortInterest":[{...}]
-        idx_b = html.find('"shortInterest":[{')
-        if idx_b > -1:
-          idx_e = html.find('],', idx_b)
-          if idx_e > -1:
-            json_txt = '[' + html[idx_b+17:idx_e+1]
-
-        # Try new format (Next.js RSC): \\\"shortInterest\\\":[...{...}]
-        if json_txt is None:
-          esc_pattern = '\\"shortInterest\\":'
-          idx_b = html.find(esc_pattern)
-          if idx_b > -1:
-            # Find the closing bracket, accounting for escaped quotes
-            search_start = idx_b + len(esc_pattern)
-            # Skip the opening '[' and possible RSC reference string like \"$62:...\"
-            bracket_start = html.find('[', search_start)
-            if bracket_start > -1:
-              # Find matching ']' — scan for '],\\"' or '],' or ']}' pattern
-              depth = 0
-              idx_e = bracket_start
-              for ci in range(bracket_start, min(bracket_start + 50000, len(html))):
-                if html[ci] == '[':
-                  depth += 1
-                elif html[ci] == ']':
-                  depth -= 1
-                  if depth == 0:
-                    idx_e = ci
-                    break
-              if idx_e > bracket_start:
-                raw = html[bracket_start:idx_e+1]
-                # Un-escape: \\\" → " and \\\\ → backslash
-                raw = raw.replace('\\"', '"')
-                # Remove RSC reference strings like "$62:props:children:..." at start of array
-                import re
-                raw = re.sub(r'^\[\s*"[^"]*"\s*,', '[', raw)
-                json_txt = raw
-
-        if json_txt is not None:
-          df_benz  = pd.read_json(StringIO(json_txt), orient='records')
-          # Some fields may be strings instead of numbers
-          for col in ['totalShortInterest', 'averageDailyVolume', 'shortPriorMo',
-                      'sharesFloat', 'sharesOutstanding']:
-            if col in df_benz.columns:
-              df_benz[col] = pd.to_numeric(df_benz[col], errors='coerce')
-          df_benz['Date'] = pd.to_datetime(df_benz['recordDate'], format='%Y-%m-%d')
-          df_benz.set_index('Date', inplace=True, drop=True)
-          df_benz = df_benz.rename(columns={
-            'totalShortInterest': 'currentShortPositionQuantity',
-            'averageDailyVolume':  'averageDailyVolumeQuantity',
-            'daysToCover':         'shortRatio',
-            'shortPercentOfFloat': 'shortFloat',
-          })
-          df_benz['shortRatio'] = df_benz['currentShortPositionQuantity'] / df_benz['averageDailyVolumeQuantity']
-          stock_dt_idx = pd.to_datetime(stock_df['Date'])
-          df_pos = df_benz[['currentShortPositionQuantity', 'averageDailyVolumeQuantity',
-                             'shortRatio', 'shortFloat']].reindex(stock_dt_idx, method='pad')
-          df_pos.index = range(len(df_pos))
-          print(f'  Short interest: {len(df_benz)} records loaded')
-        else:
-          print(f'  WARNING: Could not find shortInterest data in Benzinga page')
-    except Exception as e:
-      print(f'  WARNING: Failed to fetch short interest: {e}')
-
-  elif is_tw:
-    try:
-      BARS  = len(stock_df)
-      token = ticker[:ticker.index('.')] if '.' in ticker else ticker
-
-      if finlab_token:
-        # ── FinLab path ───────────────────────────────────────────────
-        print(f'  Fetching TW institutional investors (FinLab): {ticker}')
-        import finlab as _finlab
-        from finlab import data as _finlab_data
-        _finlab.login(finlab_token)
-
-        volume_fl = _finlab_data.get('price:成交股數').tail(BARS).div(1000).round(0)
-        foreign_agency_fl = (
-          _finlab_data.get('institutional_investors_trading_summary:外陸資買賣超股數(不含外資自營商)') +
-          _finlab_data.get('institutional_investors_trading_summary:外資自營商買賣超股數')
-        ).tail(BARS).div(1000)
-        trust_fl  = _finlab_data.get('institutional_investors_trading_summary:投信買賣超股數').tail(BARS).div(1000)
-        dealer_fl = (
-          _finlab_data.get('institutional_investors_trading_summary:自營商買賣超股數(自行買賣)') +
-          _finlab_data.get('institutional_investors_trading_summary:自營商買賣超股數(避險)')
-        ).tail(BARS).div(1000)
-        lending_sell_fl = _finlab_data.get('security_lending_sell:借券賣出餘額').tail(BARS).div(1000).round(0)
-        margin_buy_fl   = _finlab_data.get('margin_transactions:融資今日餘額').tail(BARS)
-        margin_sell_fl  = _finlab_data.get('margin_transactions:融券今日餘額').tail(BARS)
-
-        col_check = lambda df, col: df[col] if col in df.columns else pd.Series(np.nan, index=df.index)
-        df_all = pd.concat([
-          col_check(volume_fl,         token),
-          col_check(foreign_agency_fl, token),
-          col_check(trust_fl,          token),
-          col_check(dealer_fl,         token),
-          col_check(lending_sell_fl,   token),
-          col_check(margin_buy_fl,     token),
-          col_check(margin_sell_fl,    token),
-        ], axis=1)
-        df_all.columns = ['volume', 'foreign', 'trust', 'dealer', 'foreignShortBalance', 'lendingBalance', 'borrowingBalance']
-
-      else:
-        # ── histock path ──────────────────────────────────────────────
-        print(f'  Fetching TW institutional investors (histock): {ticker}')
-        histock_url = tw_sf_url
-
-        # Volume from OHLCV already fetched via Yahoo Finance
-        vol_series = stock_df[['Date', 'Volume']].copy()
-        vol_series = vol_series.set_index(pd.to_datetime(vol_series['Date']))['Volume'].div(1000).round(0)
-
-        # Financing stats (融資/融券/借券賣出) from histock (?m=mg)
-        df_fin = None
-        try:
-          import json as _json
-          r_fin = s.get(f'{histock_url}?no={token}&m=mg', timeout=10, verify=False)
-          if r_fin.status_code == 200:
-            r_fin.encoding = 'utf-8'
-            html_fin = r_fin.text
-            fin_col_list = ["'融資餘額(張)'", "'融券餘額(張)'", "'借券賣出餘額(張)'"]
-            fin_data_list = []
-            for c in fin_col_list:
-              idx_b = html_fin.find(f"{c},\r\n") + len(c) + 1
-              if idx_b <= len(c) + 21:
-                continue
-              idx_e = html_fin.find(",\r\n", idx_b)
-              raw = html_fin[idx_b:idx_e].strip()
-              fin_data_list.append(_json.loads(raw[6:]))
-            if len(fin_data_list) == 3:
-              dfs_fin = [
-                pd.DataFrame(l, columns=['date', fin_col_list[i]]).set_index('date')
-                for i, l in enumerate(fin_data_list)
-              ]
-              df_fin = pd.concat(dfs_fin, axis=1)
-              df_fin.index = pd.to_datetime(df_fin.index, unit='ms')
-              df_fin.rename(columns={
-                "'融資餘額(張)'": 'BB', "'融券餘額(張)'": 'SB', "'借券賣出餘額(張)'": 'LSB'
-              }, inplace=True)
-        except Exception as e_fin:
-          print(f'  WARNING: histock financing fetch failed: {e_fin}')
-
-        # Institutional investors (三大法人) from histock (?m=si)
-        df_inst = None
-        try:
-          import re as _re, json as _json
-          r_inst = s.get(f'{histock_url}?no={token}&m=si', timeout=10, verify=False)
-          if r_inst.status_code == 200:
-            r_inst.encoding = 'utf-8'
-            html_inst = r_inst.text
-            type_alias = [('foreign', 'FI'), ('ing', 'IT'), ('dealer', 'DL')]
-            data_frames_inst = []
-            for type_key, alias in type_alias:
-              m_inst = _re.search(
-                rf"type\s*==\s*'{type_key}'.*?threeData\s*=\s*'(\[\[.*?\]\])'",
-                html_inst, _re.DOTALL,
-              )
-              if not m_inst:
-                continue
-              parsed = _json.loads(m_inst.group(1))
-              df_i = pd.DataFrame(parsed, columns=['date', alias]).set_index('date')
-              data_frames_inst.append(df_i)
-            if data_frames_inst:
-              df_inst = pd.concat(data_frames_inst, axis=1)
-              df_inst.index = pd.to_datetime(df_inst.index, unit='ms')
-        except Exception as e_inst:
-          print(f'  WARNING: histock institutional fetch failed: {e_inst}')
-
-        # Combine: volume + institutional (FI/IT/DL) + financing (LSB/SB/BB)
-        nan_inst = pd.DataFrame(np.nan, index=vol_series.index, columns=['FI', 'IT', 'DL'])
-        nan_fin  = pd.DataFrame(np.nan, index=vol_series.index, columns=['LSB', 'SB', 'BB'])
-        df_all = pd.concat([
-          vol_series,
-          df_inst[['FI', 'IT', 'DL']] if df_inst is not None else nan_inst,
-          df_fin[['LSB', 'SB', 'BB']] if df_fin is not None else nan_fin,
-        ], axis=1)
-        df_all.columns = ['volume', 'foreign', 'trust', 'dealer', 'foreignShortBalance', 'lendingBalance', 'borrowingBalance']
-
-      # Get main force data from CMoney
-      print(f'  Fetching CMoney MainForce: {token}')
-      cm_headers = {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive',
-        'Referer': f'{cm_url}?action=mf&id={token}',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
-        'X-Requested-With': 'XMLHttpRequest',
-        'sec-ch-ua': '"Microsoft Edge";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-      }
-      cm_params = {
-        'action': 'mf',
-        'count': str(BARS),
-        'id': token,
-        'ck': 'ML7EuNTM4B87LWAfCN94XIUVRMUVIHmjrEY^DHVQHBWwCRQrCXC3jMk$5OErz',
-      }
-      ck = ''
-      try:
-        r_ck = s.get(f'{cm_url}?action=mf&id={token}', headers=cm_headers)
-        if r_ck.status_code == 200:
-          idx_b = r_ck.text.index('var ck = "') + 10
-          if idx_b > 0:
-            idx_e = r_ck.text.index('";', idx_b)
-            ck = r_ck.text[idx_b:idx_e]
-            cm_params['ck'] = ck
-      except Exception:
-        pass
-
-      mf_list = []
-      mf_acc_list = []
-      buy_sum_list = []
-      epoch_list = []
-      if ck != '':
-        try:
-          r_mf = s.get(cm_url2, params=cm_params, headers=cm_headers)
-          if r_mf.status_code == 200:
-            cm_data = r_mf.json()
-            if cm_data is not None and "DataLine" in cm_data:
-              for c in cm_data["DataLine"]:
-                epoch_list.append(c[0])
-                if c[8] is not None:
-                  mf_list.append(c[8]["MfOvrBuy"])
-                  mf_acc_list.append(c[8]["MfOvrBuySm"])
-                  buy_sum_list.append(c[8]["BuyerSm"])
-                else:
-                  mf_list.append(0)
-                  mf_acc_list.append(0)
-                  buy_sum_list.append(0)
-        except Exception as e_mf:
-          print(f'  WARNING: CMoney MainForce failed: {e_mf}')
-
-      if len(mf_list) > 0:
-        df_mf = pd.DataFrame(
-          {'mf': mf_list, 'mf_acc': mf_acc_list, 'buy_sum': buy_sum_list},
-          index=pd.to_datetime(epoch_list, unit='ms').rename('date')
-        )
-        df_all = pd.concat([df_all, df_mf], axis=1, join="outer")
-      else:
-        df_all['mf'] = np.nan
-        df_all['mf_acc'] = np.nan
-        df_all['buy_sum'] = np.nan
-
-      df_all['foreign_acc'] = df_all['foreign'].cumsum()
-      df_all['trust_acc']   = df_all['trust'].cumsum()
-      df_all['dealer_acc']  = df_all['dealer'].cumsum()
-
-      df_all.fillna(value=np.nan, inplace=True)
-
-      stock_dt_idx = pd.to_datetime(stock_df['Date'])
-      df_pos       = df_all.reindex(stock_dt_idx, method='pad')
-      df_pos.index = range(len(df_pos))
-
-      gc.collect()
-    except Exception as e:
-      print(f'  WARNING: Failed to fetch FinLab data: {e}')
-
-  # ── 6. 顏色與共用設定 ─────────────────────────────────────────────
-  c_red    = "#ff0000"
-  c_green  = "#008000"
-  c_blue   = "#0000ff"
-  c_black  = "#000000"
-  c_orange = "#ffa500"
-  c_white  = "#ffffff"
-  c_gray   = "#cbcbcb"
-  c_purple = "#e040fb"
-  c_d      = c_blue
-  c_w      = c_green
-  c_m      = c_orange
-  c_y      = c_red
-  c_bkg    = "#ffffff"
-  c_up     = "#ec0000"
-  c_down   = "#00da3c"
-  c_up_l   = "#8A0000"
-  d_down_l = "#008F28"
-  c_axis_p = "#777777"
-
-  f_str = '{:.4f}' if stock_df['Close'].values[-1] < 1 else '{:.2f}'
-
-  # ── 7. 計算輔助統計 ───────────────────────────────────────────────
-  ma_200_diff_std = stock_df['MA 200 Diff'].std()
-  atr_mean = stock_df['ATR'].fillna(0).mean()
-  vol_mean = stock_df['Volume'].tail(200).mean()
-  vol_std2 = 2 * stock_df['Volume'].tail(200).std()
-
-  price_chg = pd.DataFrame()
-  price_chg['diff'] = stock_df['Close'].diff()
-  price_chg['up']   = stock_df.where(price_chg['diff'] > 0, 0)['Volume']
-  price_chg['down'] = stock_df.where(price_chg['diff'] <= 0, 0)['Volume']
-
-  data_ohlc = stock_df[['Open', 'Close', 'Low', 'High']].map(f_str.format).values.tolist()
-
-  order_value = 20
-  data_points = []
-  floor_val   = float(stock['priceFloor'])
-  ceiling_val = float(stock['priceCeiling'])
-
-  idx_max = argrelextrema(stock_df['High'].values, np.greater, order=order_value)[0]
-  if len(idx_max) > 0:
-    for i in range(len(idx_max)):
-      data_points.append(opts.MarkPointItem(
-        name='L_MAX',
-        coord=[dates[idx_max[i]], stock_df['High'][idx_max[i]] * 1.03],
-        value=f'{stock_df["High"][idx_max[i]]:.2f}',
-        symbol='circle', symbol_size=3,
-        itemstyle_opts=opts.ItemStyleOpts(color=c_black),
-      ))
-
-  idx_min = argrelextrema(stock_df['Low'].values, np.less, order=order_value)[0]
-  if len(idx_min) > 0:
-    for i in range(len(idx_min)):
-      data_points.append(opts.MarkPointItem(
-        name='L_MIN',
-        coord=[dates[idx_min[i]], stock_df['Low'][idx_min[i]] * 0.97],
-        value=f'{stock_df["Low"][idx_min[i]]:.2f}',
-        symbol='circle', symbol_size=3,
-        itemstyle_opts=opts.ItemStyleOpts(color=c_black),
-      ))
-
-  close_offset  = f'{float(data_ohlc[-1][3])*1.03:.2f}'
-  close_comment = (
-    f'{data_ohlc[-1][1]}\n'
-    f'{((float(data_ohlc[-1][1])-float(data_ohlc[-2][1]))/float(data_ohlc[-2][1]))*100:.2f}%'
-  )
-  data_points.append(opts.MarkPointItem(
-    name='close', coord=[dates[-1], close_offset],
-    value=close_comment, symbol_size=6, symbol='diamond',
-    itemstyle_opts=opts.ItemStyleOpts(color=c_black),
-  ))
-
-  # ── 7b. Critical point markers ────────────────────────────────────
-  # 標記說明（buy 紅色置於 Low×0.95，sell 綠色置於 High×1.05，BB 紫色置於中點）：
-  #   UL  ▲ 紅色三角  Low×0.95  KD 買點：週KD 或 合成KD 在低檔（K<20）出現黃金交叉
-  #   DL  ▲ 綠色三角  High×1.05 KD 賣點：週KD 或 合成KD 在高檔（K>80）出現死亡交叉
-  #   UM  ↑ 紅色箭頭  Low×0.95  MACD 多訊號：週MACD Hist 零軸上穿，或週MACD Hist 局部低點反轉向上
-  #   DM  ↓ 綠色箭頭  High×1.05 MACD 空訊號：週MACD Hist 零軸下穿，或週MACD Hist 局部高點反轉向下
-  #   UP  ◆ 紅色菱形  Low×0.95  多方訊號：MA200 Diff 局部低點反轉，或三條長均線（60/150/200）同步由下轉上彎
-  #   DP  ◆ 綠色菱形  High×1.05 空方訊號：MA200 Diff 局部高點反轉，或三條長均線（60/150/200）同步由上轉下彎
-  #   BB  ● 紫色圓形  中點       布林收縮：BB 上下軌間距局部極小值，波動率壓縮、即將方向性突破（方向待確認）
-  # tag → (symbol, size, color, price_factor, use_high)
-  # use_high=True → High×factor, False → Low×factor, None → (High+Low)/2
-  _c_buy  = '#ec0000'
-  _c_sell = '#00da3c'
-  _tag_cfg = {
-    'UL': ('triangle', 8, _c_buy,  0.95, False),  # KD buy
-    'DL': ('triangle', 8, _c_sell, 1.05, True ),  # KD sell
-    'UM': ('arrow',    6, _c_buy,  0.95, False),  # MACD buy
-    'DM': ('arrow',    6, _c_sell, 1.05, True ),  # MACD sell
-    'UP': ('diamond',  6, _c_buy,  0.95, False),  # general buy
-    'DP': ('diamond',  6, _c_sell, 1.05, True ),  # general sell
-    'BB': ('circle',   5, '#e040fb', 1.00, None),  # BB squeeze
-  }
-  for idx_sig, tag in sig_dates_list:
-    if idx_sig >= len(dates):
-      continue
-    cfg = _tag_cfg.get(tag)
-    if cfg is None:
-      continue
-    sym, sz, col, factor, use_high = cfg
-    if use_high is None:
-      price = (stock_df['High'][idx_sig] + stock_df['Low'][idx_sig]) / 2
-    elif use_high:
-      price = stock_df['High'][idx_sig] * factor
-    else:
-      price = stock_df['Low'][idx_sig] * factor
-    data_points.append(opts.MarkPointItem(
-      name=tag, coord=[dates[idx_sig], price],
-      value=tag, symbol=sym, symbol_size=sz,
-      itemstyle_opts=opts.ItemStyleOpts(color=col),
-    ))
-
-  # ── 7b2. TD9 + FVG markpoints (from regime analysis) ────────────────
-  if _regime_df is not None:
-    for i in range(len(_regime_df)):
-      if _regime_df['TD9_Up'].iloc[i]:
-        data_points.append(opts.MarkPointItem(
-          name='TD9↓', coord=[dates[i], float(stock_df['High'].iloc[i] * 1.03)],
-          value='9', symbol='triangle', symbol_size=8,
-          itemstyle_opts=opts.ItemStyleOpts(color='#333')))
-      if _regime_df['TD9_Down'].iloc[i]:
-        data_points.append(opts.MarkPointItem(
-          name='TD9↑', coord=[dates[i], float(stock_df['Low'].iloc[i] * 0.97)],
-          value='9', symbol='triangle', symbol_size=8,
-          itemstyle_opts=opts.ItemStyleOpts(color='#333')))
-      if _regime_df['Bullish_FVG'].iloc[i]:
-        data_points.append(opts.MarkPointItem(
-          name='Bull FVG', coord=[dates[max(0, i - 1)], float(stock_df['Low'].iloc[i] * 0.97)],
-          value='F', symbol='arrow', symbol_size=7,
-          itemstyle_opts=opts.ItemStyleOpts(color='#FFA500')))
-      if _regime_df['Bearish_FVG'].iloc[i]:
-        data_points.append(opts.MarkPointItem(
-          name='Bear FVG', coord=[dates[max(0, i - 1)], float(stock_df['High'].iloc[i] * 1.03)],
-          value='F', symbol='arrow', symbol_size=7,
-          itemstyle_opts=opts.ItemStyleOpts(color='#FFA500')))
-
-  # ── 7c. Volume Profile / POC markline ──────────────────────────────
-  VP_SEGS = 150
-  VP_BARS = 200
-  VP_SPAN = 50
-
-  vp_marklines = []
-  vp, poc_idx = vp_get_vp_and_poc(stock_df, bars=VP_BARS, segs=VP_SEGS, fmt_str=f_str)
-  if poc_idx != -1:
-    round_factor_v = vp.max() / VP_SPAN
-    vp_hist = vp.apply(lambda x: round(x / round_factor_v))
-    for price_level, bar_len in vp_hist.items():
-      # Volume profile horizontal bar
-      vp_marklines.append([
-        opts.MarkLineItem(coord=[dates[-VP_BARS], price_level]),
-        opts.MarkLineItem(coord=[dates[-VP_BARS + bar_len], price_level]),
-      ])
-      # POC line extending to the right edge
-      if price_level == poc_idx:
-        vp_marklines.append([
-          opts.MarkLineItem(coord=[dates[-VP_BARS + bar_len + 5], price_level]),
-          opts.MarkLineItem(coord=[dates[-1], price_level]),
-        ])
-
-  # ── 8. Grid index 配置 + 自動佈局計算 ───────────────────────────────
-  # pyecharts panels: 0=kline, 1=ATR, 2=Vol, 3=Mom, 4=MACD, 5=KD, 6=RSI, 7=CCI
-  # position panels (US): 8=short bar, 9=short ratio line
-  # position panels (TW): 8=inst bar, 9=buysum, 10=acc line, 11=finance line
-  GRID_PY_COUNT = 8
-
-  # ═══ 佈局比例設定 (只需調整這裡的數字即可) ════════════════════════════
-  kline_px       = 500                        # K線固定像素高度
-  bottom_reserve = 3                          # 底部保留 (datazoom slider 空間)
-  layout_start   = 2                          # 上邊界 (%)
-  layout_gap     = 1                          # 圖表間距 (%)
-  tech_ratios  = [20, 4, 4, 4, 4, 8, 8, 8]  # kline, ATR, Vol, Mom, MACD, KD, RSI, CCI
-  if is_us and df_pos is not None:
-    pos_ratios = [8, 8]                   # short_bar, short_ratio_line
-  elif is_tw and df_pos is not None:
-    pos_ratios = [8, 4, 8, 8]             # inst_bar, buysum_line, acc_line, finance_line
-  else:
-    pos_ratios = []
-  # ═════════════════════════════════════════════════════════════════════
-
-  all_ratios  = tech_ratios + pos_ratios
-  n_charts    = len(all_ratios)
-  total_gaps  = layout_gap * (n_charts - 1)
-  ratio_sum   = sum(all_ratios)
-  bottom_pct  = bottom_reserve / (ratio_sum + bottom_reserve) * 100
-  avail_pct   = 100 - layout_start - total_gaps - bottom_pct
-
-  # grid_layout[i] = (pos_top_str, height_str)  e.g. ('2%', '15%')
-  grid_layout = []
-  cur = layout_start
-  for r in all_ratios:
-    h = r / ratio_sum * avail_pct
-    grid_layout.append((f'{cur:.1f}%', f'{h:.1f}%'))
-    cur += h + layout_gap
-
-  total_grids = GRID_PY_COUNT + len(pos_ratios)
-  dz_indices  = list(range(total_grids))
-
-  # notes overlay: 10% up from the bottom of the kline chart area
-  _kline_top_f = float(grid_layout[0][0].rstrip('%'))
-  _kline_h_f   = float(grid_layout[0][1].rstrip('%'))
-  notes_top    = f'{_kline_top_f + _kline_h_f * 0.85:.1f}%'
-  total_h_px  = int((ratio_sum + bottom_reserve) / tech_ratios[0] * kline_px)
-  total_h     = f'{total_h_px}px'
-  dz_pos_top  = f'{100 - bottom_pct + layout_gap:.1f}%'
-
-  # ── 9. 技術指標 sub-charts ────────────────────────────────────────
-  kline_chart = (
-    Kline(init_opts=opts.InitOpts(animation_opts=opts.AnimationOpts(animation=False)))
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis(
-      'K-LINE', data_ohlc,
-      itemstyle_opts=opts.ItemStyleOpts(color=c_up, color0=c_down, border_color=c_up_l, border_color0=d_down_l),
-      markpoint_opts=opts.MarkPointOpts(data=data_points, symbol='pin', label_opts=opts.LabelOpts(font_size=10)),
-      markline_opts=opts.MarkLineOpts(
-        data=vp_marklines,
-        symbol=['none', 'none'],
-        label_opts=opts.LabelOpts(is_show=False),
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.4, color=c_gray),
-      ) if vp_marklines else None,
-    )
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(is_scale=True, axislabel_opts=opts.LabelOpts(font_size=8),
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               splitline_opts=opts.SplitLineOpts(is_show=False)),
-      yaxis_opts=opts.AxisOpts(is_scale=True, axislabel_opts=opts.LabelOpts(font_size=8)),
-      tooltip_opts=opts.TooltipOpts(trigger='axis', axis_pointer_type='cross',
-                                    textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      datazoom_opts=[
-        opts.DataZoomOpts(is_show=False, type_='inside', xaxis_index=dz_indices,
-                          range_start=50, range_end=100, is_realtime=False),
-        opts.DataZoomOpts(is_show=True, xaxis_index=dz_indices, type_='slider',
-                          pos_top=dz_pos_top, range_start=50, range_end=100, is_realtime=False),
-      ],
-      axispointer_opts=opts.AxisPointerOpts(is_show=True, link=[{'xAxisIndex': 'all'}],
-                                             label=opts.LabelOpts(background_color=c_axis_p)),
-      title_opts=opts.TitleOpts(title=f'{ticker} - {dates[-1]}', pos_left='5%'),
-      toolbox_opts=opts.ToolboxOpts(
-        is_show=True,
-        feature={'dataZoom': {'yAxisIndex': 'none'}, 'restore': {}, 'saveAsImage': {}},
-      ),
-      graphic_opts=opts.GraphicGroup(
-        graphic_item=opts.GraphicItem(left='75%', top=notes_top),
-        children=[
-          opts.GraphicText(
-            graphic_item=opts.GraphicItem(left='center', top='middle', z=100),
-            graphic_textstyle_opts=opts.GraphicTextStyleOpts(
-              text='\n'.join(sig_notes),
-            ),
-          ),
-        ],
-      ),
-    )
-  )
-
-  lines_chart = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('MA 10', stock_df['MA 10'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_black),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_black), z=6,
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'name': 'floor',   'yAxis': floor_val,   'lineStyle': {'color': c_black, 'type': 'dotted'}},
-                       {'name': 'ceiling', 'yAxis': ceiling_val, 'lineStyle': {'color': c_black, 'type': 'dotted'}}],
-                 symbol=['none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')))
-    .add_yaxis('MA 20',  stock_df['MA 20'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.7, color=c_d),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=5)
-    .add_yaxis('MA 60',  stock_df['MA 60'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.5, color=c_m),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m), z=4)
-    .add_yaxis('MA 150', stock_df['MA 150'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.3, color=c_y),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_y), z=3)
-    .add_yaxis('MA 200', stock_df['MA 200'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.3, color=c_purple),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_purple), z=2)
-    .add_yaxis('BB H', stock_df['BB Upper'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_m),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m),
-               areastyle_opts=opts.AreaStyleOpts(opacity=0.2, color=c_m), z=-2)
-    .add_yaxis('BB L', stock_df['BB Lower'].map(f_str.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_m),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m),
-               areastyle_opts=opts.AreaStyleOpts(opacity=1, color=c_white), z=-1)
-    .set_global_opts(xaxis_opts=opts.AxisOpts(type_='category'))
-  )
-  if _regime_df is not None:
-    kf_line = (
-      Line()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis('KF', _regime_df['KF_Position'].map(f_str.format).tolist(),
-                 is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-                 linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.9, color='#00BFFF'),
-                 label_opts=opts.LabelOpts(is_show=False),
-                 itemstyle_opts=opts.ItemStyleOpts(color='#00BFFF'), z=7)
-      .set_global_opts(xaxis_opts=opts.AxisOpts(type_='category'))
-    )
-    lines_chart = lines_chart.overlap(kf_line)
-  overlap_kline_line = kline_chart.overlap(lines_chart)
-
-  atr_lines = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('ATR 5', stock_df['ATR 5'].map('{:.2f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_black),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_black), z=6)
-    .add_yaxis('ATR 20', stock_df['ATR'].map('{:.2f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d),
-               markline_opts=opts.MarkLineOpts(data=[{'yAxis': atr_mean}], symbol=['none'],
-                 label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')), z=5)
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=1, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=1, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[1][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-
-  volume_bar = (
-    Bar()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('up', price_chg['up'].tolist(), stack='stack1',
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_up),
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'yAxis': vol_mean}, {'yAxis': vol_mean + vol_std2}],
-                 symbol=['none', 'none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')))
-    .add_yaxis('down', price_chg['down'].tolist(), stack='stack1',
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_down))
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=2, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=2, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(is_show=False),
-    )
-  )
-  vol_lines = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('Vol MA 20', stock_df['Vol MA 20'].map('{:.0f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=100)
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category'),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[2][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-  overlap_vol_line = volume_bar.overlap(vol_lines)
-
-  mom_lines = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('Work (5)', stock_df['Work (5)'].map('{:.2f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.5, color=c_blue),
-               areastyle_opts=opts.AreaStyleOpts(opacity=0.5, color=c_blue),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_blue), z=5)
-    .add_yaxis('Work (W)', stock_df_w_resample['Work'].map('{:.2f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_green),
-               areastyle_opts=opts.AreaStyleOpts(opacity=1, color=c_green),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_green), z=4)
-    .add_yaxis('Vel (5)', stock_df['Vel (5)'].map('{:.2f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_black),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_black), z=6,
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'yAxis': 0}, {'yAxis': 2}, {'yAxis': -2}],
-                 symbol=['none', 'none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')))
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=3, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=3, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[3][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-
-  macd_bars = (
-    Bar()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('MACD Hist',   stock_df['MACD Hist'].map('{:.2f}'.format).tolist(),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=6)
-    .add_yaxis('MACD Hist (W)', stock_df_w_resample['MACD Hist'].map('{:.2f}'.format).tolist(),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_w), z=5)
-    .add_yaxis('MACD Hist (R)', stock_df['MACD Hist (R)'].map('{:.2f}'.format).tolist(),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m), z=7)
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=4, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=4, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[4][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-
-  kd_lines = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('Slow K9 (C)', stock_df['Combined K'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_red),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_red), z=8)
-    .add_yaxis('Slow D9 (C)', stock_df['Combined D'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_red, type_='dotted'),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_red), z=7)
-    .add_yaxis('Slow K9',   stock_df['Slow K'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=6)
-    .add_yaxis('Slow D9',   stock_df['Slow D'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d, type_='dotted'),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=5)
-    .add_yaxis('Slow K9 (W)', stock_df_w_resample['Slow K'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.7, color=c_w),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_w), z=4)
-    .add_yaxis('Slow D9 (W)', stock_df_w_resample['Slow D'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.7, color=c_w, type_='dotted'),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_w), z=3)
-    .add_yaxis('Slow K9 (M)', stock_df_m_resample['Slow K'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.5, color=c_m),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m), z=2,
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'yAxis': 20}, {'yAxis': 50}, {'yAxis': 80}],
-                 symbol=['none', 'none', 'none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')))
-    .add_yaxis('Slow D9 (M)', stock_df_m_resample['Slow D'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.5, color=c_m, type_='dotted'),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m), z=1)
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=5, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=5, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[5][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-
-  rsi_lines = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    .add_yaxis('MA 200 DIFF', stock_df['MA 200 Diff'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_purple),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_purple), z=4,
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'yAxis': 0}, {'yAxis': ma_200_diff_std}, {'yAxis': -ma_200_diff_std}],
-                 symbol=['none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_purple, type_='dotted')))
-    .add_yaxis('RSI 14', stock_df['RSI 14'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=3,
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'yAxis': 30}, {'yAxis': 50}, {'yAxis': 70}],
-                 symbol=['none', 'none', 'none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')))
-    .add_yaxis('RSI 14 (W)', stock_df_w_resample['RSI 14'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.7, color=c_w),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_w), z=2)
-    .add_yaxis('RSI 14 (M)', stock_df_m_resample['RSI 14'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.5, color=c_m),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m), z=1)
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=6, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=6, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[6][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-
-  cci_lines = (
-    Line()
-    .add_xaxis(xaxis_data=dates)
-    #.add_yaxis('RS Score', stock_df['RS Score'].map('{:.1f}'.format).tolist(),
-    #           is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-    #           linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_purple),
-    #           label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_purple), z=4)
-    .add_yaxis('CCI', stock_df['CCI'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=3,
-               markline_opts=opts.MarkLineOpts(
-                 data=[{'yAxis': 100}, {'yAxis': -100}, {'yAxis': 0}],
-                 symbol=['none', 'none', 'none'], label_opts=opts.LabelOpts(is_show=False),
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.3, color=c_black, type_='dotted')))
-    .add_yaxis('CCI (W)', stock_df_w_resample['CCI'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.7, color=c_w),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_w), z=2)
-    .add_yaxis('CCI (M)', stock_df_m_resample['CCI'].map('{:.1f}'.format).tolist(),
-               is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-               linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.5, color=c_m),
-               label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_m), z=1)
-    .set_global_opts(
-      xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=7, boundary_gap=False,
-                               axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                               axislabel_opts=opts.LabelOpts(font_size=8),
-                               splitline_opts=opts.SplitLineOpts(is_show=False),
-                               split_number=20, min_='dataMin', max_='dataMax'),
-      yaxis_opts=opts.AxisOpts(grid_index=7, is_scale=True, split_number=5,
-                               axislabel_opts=opts.LabelOpts(font_size=8)),
-      legend_opts=opts.LegendOpts(pos_top=grid_layout[7][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-    )
-  )
-
-  # ── 10. 持倉 sub-charts ───────────────────────────────────────────
-  pos_charts = []
-
-  if is_us and df_pos is not None:
-    short_bar = (
-      Bar()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis('Avg Daily Vol', df_pos['averageDailyVolumeQuantity'].tolist(),
-                 stack='pos_stack0', label_opts=opts.LabelOpts(is_show=False),
-                 itemstyle_opts=opts.ItemStyleOpts(color=c_black), gap='0%')
-      .add_yaxis('Short Interest', df_pos['currentShortPositionQuantity'].map('{:.0f}'.format).tolist(),
-                 stack='pos_stack1', label_opts=opts.LabelOpts(is_show=False),
-                 itemstyle_opts=opts.ItemStyleOpts(color=c_d), z=3, gap='0%')
-      .set_global_opts(
-        xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=GRID_PY_COUNT,
-                                 boundary_gap=False,
-                                 axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                                 splitline_opts=opts.SplitLineOpts(is_show=False),
-                                 axislabel_opts=opts.LabelOpts(font_size=8),
-                                 split_number=20, min_='dataMin', max_='dataMax'),
-        yaxis_opts=opts.AxisOpts(grid_index=GRID_PY_COUNT, is_scale=True, split_number=5,
-                                 axislabel_opts=opts.LabelOpts(font_size=8)),
-        legend_opts=opts.LegendOpts(pos_top=grid_layout[GRID_PY_COUNT][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      )
-    )
-    short_ratio_line = (
-      Line()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis('Short Ratio', df_pos['shortRatio'].map('{:.2f}'.format).tolist(),
-                 is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_black),
-                 label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_black),
-                 z=4, is_connect_nones=True)
-      .add_yaxis('Short Float', df_pos['shortFloat'].map('{:.3f}'.format).tolist(),
-                 is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-                 linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_green),
-                 label_opts=opts.LabelOpts(is_show=False), itemstyle_opts=opts.ItemStyleOpts(color=c_green),
-                 z=3, is_connect_nones=True)
-      .set_global_opts(
-        xaxis_opts=opts.AxisOpts(type_='category', is_scale=True, grid_index=GRID_PY_COUNT+1,
-                                 boundary_gap=False,
-                                 axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-                                 axislabel_opts=opts.LabelOpts(font_size=8),
-                                 splitline_opts=opts.SplitLineOpts(is_show=False),
-                                 split_number=20, min_='dataMin', max_='dataMax'),
-        yaxis_opts=opts.AxisOpts(grid_index=GRID_PY_COUNT+1, is_scale=True, split_number=5,
-                                 axislabel_opts=opts.LabelOpts(font_size=8),
-                                 splitarea_opts=opts.SplitAreaOpts(
-                                   is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1))),
-        legend_opts=opts.LegendOpts(pos_top=grid_layout[GRID_PY_COUNT+1][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      )
-    )
-    pos_charts.append((short_bar,        opts.GridOpts(pos_top=grid_layout[GRID_PY_COUNT][0], height=grid_layout[GRID_PY_COUNT][1], pos_left='2%', pos_right='2%')))
-    pos_charts.append((short_ratio_line, opts.GridOpts(pos_top=grid_layout[GRID_PY_COUNT+1][0], height=grid_layout[GRID_PY_COUNT+1][1], pos_left='2%', pos_right='2%')))
-
-  elif is_tw and df_pos is not None:
-    inst_bar = (
-      Bar()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis(
-        series_name="Volume",
-        y_axis=df_pos["volume"].tolist(),
-        stack="pos_stack0",
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_gray),
-        gap="0%",
-      )
-      .add_yaxis(
-        series_name="Foreign",
-        y_axis=df_pos["foreign"].map('{:.0f}'.format).tolist(),
-        stack="pos_stack1",
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_d),
-        z=3,
-        gap="0%",
-      )
-      .add_yaxis(
-        series_name="Trust",
-        y_axis=df_pos["trust"].map('{:.0f}'.format).tolist(),
-        stack="pos_stack1",
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_w),
-        z=4,
-        gap="0%",
-      )
-      .add_yaxis(
-        series_name="Dealer",
-        y_axis=df_pos["dealer"].map('{:.0f}'.format).tolist(),
-        stack="pos_stack1",
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_m),
-        z=5,
-        gap="0%",
-      )
-      .add_yaxis(
-        series_name="MainForce",
-        y_axis=df_pos["mf"].map('{:.0f}'.format).tolist(),
-        stack="pos_stack2",
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_red),
-        z=6,
-        gap="0%",
-      )
-      .set_global_opts(
-        xaxis_opts=opts.AxisOpts(
-          type_="category",
-          is_scale=True,
-          grid_index=GRID_PY_COUNT,
-          boundary_gap=False,
-          axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-          splitline_opts=opts.SplitLineOpts(is_show=False),
-          axislabel_opts=opts.LabelOpts(font_size=8),
-          split_number=20,
-          min_="dataMin",
-          max_="dataMax",
-        ),
-        yaxis_opts=opts.AxisOpts(
-          grid_index=GRID_PY_COUNT,
-          is_scale=True,
-          split_number=5,
-          axislabel_opts=opts.LabelOpts(font_size=8),
-        ),
-        legend_opts=opts.LegendOpts(pos_top=grid_layout[GRID_PY_COUNT][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      )
-    )
-
-    buysum_line = (
-      Bar()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis(
-        series_name="Buy Point Sum",
-        y_axis=df_pos["buy_sum"].tolist(),
-        stack="pos_stack3",
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_gray),
-        gap="0%",
-      )
-      .set_global_opts(
-        xaxis_opts=opts.AxisOpts(
-          type_="category",
-          is_scale=True,
-          grid_index=GRID_PY_COUNT+1,
-          boundary_gap=False,
-          axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-          splitline_opts=opts.SplitLineOpts(is_show=False),
-          axislabel_opts=opts.LabelOpts(font_size=8),
-          split_number=20,
-          min_="dataMin",
-          max_="dataMax",
-        ),
-        yaxis_opts=opts.AxisOpts(
-          grid_index=GRID_PY_COUNT+1,
-          is_scale=True,
-          split_number=5,
-          axislabel_opts=opts.LabelOpts(font_size=8),
-        ),
-        legend_opts=opts.LegendOpts(pos_top=grid_layout[GRID_PY_COUNT+1][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      )
-    )
-
-    acc_line = (
-      Line()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis(
-        series_name="Sum Acc",
-        y_axis=(df_pos["foreign_acc"]+df_pos["trust_acc"]+df_pos["dealer_acc"]).map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_black),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_black),
-        z=4,
-        is_connect_nones=True,
-      )
-      .add_yaxis(
-        series_name="Foreign Acc",
-        y_axis=df_pos["foreign_acc"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_d),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_d),
-        z=3,
-        is_connect_nones=True,
-      )
-      .add_yaxis(
-        series_name="Trust Acc",
-        y_axis=df_pos["trust_acc"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_w),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_w),
-        z=2,
-        is_connect_nones=True,
-      )
-      .add_yaxis(
-        series_name="Dealer Acc",
-        y_axis=df_pos["dealer_acc"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_m),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_m),
-        z=1,
-        is_connect_nones=True,
-      )
-      .add_yaxis(
-        series_name="MainForce Acc",
-        y_axis=df_pos["mf_acc"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_red, type_="dotted"),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_red),
-        z=5,
-        is_connect_nones=True,
-      )
-      .set_global_opts(
-        xaxis_opts=opts.AxisOpts(
-          type_="category",
-          is_scale=True,
-          grid_index=GRID_PY_COUNT+2,
-          boundary_gap=False,
-          axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-          axislabel_opts=opts.LabelOpts(font_size=8),
-          splitline_opts=opts.SplitLineOpts(is_show=False),
-          split_number=20,
-          min_="dataMin",
-          max_="dataMax",
-        ),
-        yaxis_opts=opts.AxisOpts(
-          grid_index=GRID_PY_COUNT+2,
-          is_scale=True,
-          split_number=5,
-          axislabel_opts=opts.LabelOpts(font_size=8),
-          splitarea_opts=opts.SplitAreaOpts(
-            is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1)
-          ),
-        ),
-        legend_opts=opts.LegendOpts(pos_top=grid_layout[GRID_PY_COUNT+2][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      )
-    )
-
-    finance_line = (
-      Line()
-      .add_xaxis(xaxis_data=dates)
-      .add_yaxis(
-        series_name="Foreign Short Selling",
-        y_axis=df_pos["foreignShortBalance"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_green),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_green),
-        z=3,
-      )
-      .add_yaxis(
-        series_name="Margin Trading",
-        y_axis=df_pos["borrowingBalance"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_red),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_red),
-        z=2,
-      )
-      .add_yaxis(
-        series_name="Short Selling",
-        y_axis=df_pos["lendingBalance"].map('{:.0f}'.format).tolist(),
-        is_smooth=False,
-        is_symbol_show=False,
-        is_hover_animation=False,
-        linestyle_opts=opts.LineStyleOpts(width=1, opacity=1, color=c_green, type_="dotted"),
-        label_opts=opts.LabelOpts(is_show=False),
-        itemstyle_opts=opts.ItemStyleOpts(color=c_green),
-        z=1,
-      )
-      .set_global_opts(
-        xaxis_opts=opts.AxisOpts(
-          type_="category",
-          is_scale=True,
-          grid_index=GRID_PY_COUNT+3,
-          boundary_gap=False,
-          axisline_opts=opts.AxisLineOpts(is_on_zero=False),
-          axislabel_opts=opts.LabelOpts(font_size=8),
-          splitline_opts=opts.SplitLineOpts(is_show=False),
-          split_number=20,
-          min_="dataMin",
-          max_="dataMax",
-        ),
-        yaxis_opts=opts.AxisOpts(
-          grid_index=GRID_PY_COUNT+3,
-          is_scale=True,
-          split_number=5,
-          axislabel_opts=opts.LabelOpts(font_size=8),
-          splitarea_opts=opts.SplitAreaOpts(
-            is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1)
-          ),
-        ),
-        legend_opts=opts.LegendOpts(pos_top=grid_layout[GRID_PY_COUNT+3][0], textstyle_opts=opts.TextStyleOpts(font_size=8)),
-      )
-    )
-
-    pos_charts.append((inst_bar,      opts.GridOpts(pos_top=grid_layout[GRID_PY_COUNT][0],   height=grid_layout[GRID_PY_COUNT][1],   pos_left='2%', pos_right='2%')))
-    pos_charts.append((buysum_line,   opts.GridOpts(pos_top=grid_layout[GRID_PY_COUNT+1][0], height=grid_layout[GRID_PY_COUNT+1][1], pos_left='2%', pos_right='2%')))
-    pos_charts.append((acc_line,      opts.GridOpts(pos_top=grid_layout[GRID_PY_COUNT+2][0], height=grid_layout[GRID_PY_COUNT+2][1], pos_left='2%', pos_right='2%')))
-    pos_charts.append((finance_line,  opts.GridOpts(pos_top=grid_layout[GRID_PY_COUNT+3][0], height=grid_layout[GRID_PY_COUNT+3][1], pos_left='2%', pos_right='2%')))
-
-
-  # ── 11. Grid 佈局（全部由 grid_layout 自動計算）──────────────────────
-  has_pos = len(pos_charts) > 0
-
-  py_grids = [
-    opts.GridOpts(pos_top=grid_layout[i][0], height=grid_layout[i][1], pos_left='2%', pos_right='2%')
-    for i in range(GRID_PY_COUNT)
-  ]
-
-  py_sub_charts = [
-    (overlap_kline_line, py_grids[0]),
-    (atr_lines,          py_grids[1]),
-    (overlap_vol_line,   py_grids[2]),
-    (mom_lines,          py_grids[3]),
-    (macd_bars,          py_grids[4]),
-    (kd_lines,           py_grids[5]),
-    (rsi_lines,          py_grids[6]),
-    (cci_lines,          py_grids[7]),
-  ]
-
-  # ── 12. 組合 Grid ─────────────────────────────────────────────────
-  grid_chart = Grid(
-    init_opts=opts.InitOpts(
-      animation_opts=opts.AnimationOpts(animation=False),
-      width='100%',
-      height=total_h,
-      page_title=f'{ticker} - One Chart',
-      bg_color='#ffffff',
-    )
-  )
-
-  for chart, grid_opt in py_sub_charts:
-    grid_chart.add(chart, grid_opts=grid_opt)
-  for chart, grid_opt in pos_charts:
-    grid_chart.add(chart, grid_opts=grid_opt)
-
-  # ── 13. 輸出 HTML ─────────────────────────────────────────────────
-  save_html = dir + '/' + ticker + '_OC.html'
-  grid_chart.render(save_html)
-
-  # Inject regime backtest tables into HTML
-  if _regime_df is not None and (not _regime_bt_main.empty or not _regime_bt_sub.empty):
-    current_label = _regime_df.iloc[-1]['regime_label']
-    current_sub = _regime_df.iloc[-1]['regime_sub']
-    tables_html = regime_build_backtest_html(_regime_bt_main, _regime_bt_sub, current_label, current_sub)
-    #print(tables_html)
-    if tables_html:
-      with open(save_html, 'r', encoding='utf-8') as fh:
-        html_content = fh.read()
-      html_content = html_content.replace('</body>', f'{tables_html}</body>')
-      with open(save_html, 'w', encoding='utf-8') as fh:
-        fh.write(html_content)
-
-  print(f'  Saved: {save_html}')
-  return save_html
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Report helpers (from report.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-print_time_delta_start = time()
-def print_time_delta(now, note):
-  global print_time_delta_start
-  print("  {:07.3f}: {}".format(now-print_time_delta_start, note))
-  print_time_delta_start = now
-
-
-
-
-def report_get_finviz_overview(token):
-
-  print_time_delta_start = time()
-
-  url = 'https://finviz.com/quote.ashx?t=' + token
-  headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36'}
-  r = requests.get(url, headers=headers, verify=False, impersonate="chrome", timeout=10)
-  r.encoding = 'utf-8'
-
-  # https://www.quotemedia.com/quotetools/symbolHelp/SymbolHelp_US_Version_Default.html?fbclid=IwAR0yadiPkg-Mp4X-guCwFYH7oJLnO2TvXgGy1a_sn-_idcAxNpycNiLsLOE
-  chart_src = f'https://app.quotemedia.com/quotetools/getChart?webmasterId=91386&symbol={token}&chtype=FinancialLine&chcon=on&chdon=on&chfrmon=on&chscale=1d&chton=on&chwid=800&chhig=380&chln=ffa500&chfill=ffa500&chfnts=10&chbdr=000000&chbgch=ffffffff&chgrd=cccccc&svg=false&lang=en&locale=en'
-  intraday_chart = f'<div align="center"><a href="https://www.marketwatch.com/investing/stock/{token}/analystestimates" target="_blank"><img style="max-height:100%; max-width:100%; object-fit:contain" src={chart_src}></a></div>'
-
-  stats = rating = insider = news = ''
-
-  if r.status_code == 200:
-    selector = etree.HTML(r.text)
-
-    result = selector.xpath("//table[@class='js-snapshot-table snapshot-table2 screener_snapshot-table-body']")
-    if len(result) > 0:
-      stats = etree.tostring(result[0], encoding='unicode', pretty_print=True).replace('href="', 'href="https://finviz.com/')
-
-    result = selector.xpath("//table[@class='js-table-ratings styled-table-new is-rounded is-small']")                             
-    if len(result) > 0:
-      rating = etree.tostring(result[0], encoding='unicode', pretty_print=True)
+        cm_data = r.json()
+        if cm_data != None:
+          records = [
+            {
+              "date": pd.to_datetime(c[0], unit='ms'),
+              "mf": c[8]["MfOvrBuy"] if c[8] else 0,
+              "mf_acc": c[8]["MfOvrBuySm"] if c[8] else 0,
+              "b_s": c[8]["BuyerSm"] if c[8] else 0,
+            }
+            for c in cm_data.get("DataLine", [])
+          ]
   
-    result = selector.xpath("//table[@class='body-table styled-table-new is-rounded p-0 mt-2']")
-    if len(result) > 0:
-      insider = etree.tostring(result[0], encoding='unicode', pretty_print=True)
-
-    #result = selector.xpath("//table[@class='fullview-news-outer']")
-    result = selector.xpath("//div[@class='body-table-news-wrapper news-table_wrapper']")
-    if len(result) > 0:
-      news = '<div align="center">' + etree.tostring(result[0], encoding='unicode', pretty_print=True) + '</div>'
-
-    overview = '\n\n<hr color="#ff8000" align="center">\n'.join([intraday_chart, stats, rating, insider, news]).replace('width="100%"', 'align="center" width="70%"').replace('<table', '<table align="center" style="margin:0 auto"')
-    print_time_delta(time(), "[FINVIZ] " + url)
-
-    return overview
-
-  else:
-    print(f'Finviz response error code: {r.status_code}')
-    return ''
-
-
-
-
-def report_get_fbs_position_overview(token):
-
-  user_agent = 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36'
-  headers = {"User-Agent":user_agent}
-
-  if token.find('.TW') > 0:
-    print_time_delta_start = time()
+          df_mf = pd.DataFrame.from_records(records).set_index("date")
   
-    url_overview = 'http://fubon-ebrokerdj.fbs.com.tw/Z/ZC/ZCX/ZCXFUBON_' + token[0:token.index('.TW')] + '.djhtm'
-    url_major = 'http://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco_' + token[0:token.index('.TW')] + '.djhtm'
-    url_inst = 'http://fubon-ebrokerdj.fbs.com.tw/z/zc/zcl/zcl.djhtm?a=' + token[0:token.index('.TW')] + '&b=3'
-    #url_inst = 'http://fubon-ebrokerdj.fbs.com.tw/z/zc/zcl/zcl_' + token[0:token.index('.TW')] + '.djhtm'
-    url_news = 'https://fubon-ebrokerdj.fbs.com.tw/z/zc/zcv/zcv_' + token[0:token.index('.TW')] + '_E_1.djhtm'  
-    absolute_prefix = 'http://fubon-ebrokerdj.fbs.com.tw'
-       
-    stats = ''
+          df_mf_reset = df_mf.tail(BARS).reset_index()
+          df_mf_reset['date'] = df_mf_reset['date'].dt.strftime('%Y-%m-%d')
+          return_value = df_mf_reset.to_dict(orient='records')
 
-    # Handle overview
-    r = requests.get(url_overview, headers=headers, verify=False, impersonate="chrome", timeout=5)
-    r.encoding = 'big5'
-    if r.status_code == 200:
+  return return_value
 
-      selector = etree.HTML(r.text)
 
-      # Chart
-      results = selector.xpath("//div[@class='midcontent_infomation02']")
-      if len(results) > 0:
-        result = results[0]
 
-        for node in result.xpath('//img'):
-          img_link = node.get('src').replace('169_133', '520_300')
-          url_new = absolute_prefix + img_link
-          node.set('src', url_new)
 
-        for node in result.xpath('//*[@class or @id]'):
-          node.attrib.pop('class', None)  # None is to not raise an exception if xyz does not exist
-          node.attrib.pop('id', None)
-          #node.attrib.clear()   # Clear all attributes
-
-        tmp_html = etree.tostring(result, encoding='unicode', pretty_print=True).replace('&#13;\n', '\n') 
-        stats = '  <div align="center">\n    ' + tmp_html + '\n  </div>'
-        
-        # Table for valuation
-        result1 = result.getnext().getnext().getnext()
-        for node in result1.xpath('//*[@class or @id]'):
-          node.attrib.pop('class', None)  # None is to not raise an exception if xyz does not exist
-          node.attrib.pop('id', None)
-          #node.attrib.clear()   # Clear all attributes
-
-        tmp_html = etree.tostring(result1, encoding='unicode', pretty_print=True).replace('&#13;\n', '\n')
-        stats += '  <div align="center">\n    ' + tmp_html + '\n  </div>'
+################################################################################################################################################################
+def fetch_short_stats(ticker):
+  
+  return_value = {}
+  
+  if ".TW" not in ticker:
+    headers_si = {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+      'Accept-Language': 'zh-TW,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6',
+      'Cache-Control': 'max-age=0',
+      'Connection': 'keep-alive',
+      'Referer': 'https://www.google.com/',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+    }
       
-    
-    # Handle major investors
-    r = requests.get(url_major, headers=headers, verify=False, impersonate="chrome", timeout=5)
-    r.encoding = 'big5'
+    r = requests.get(f'{si_url}/quote/{ticker}/short-interest', headers=headers_si, verify=False)
     if r.status_code == 200:
+      html = r.text
+      idx_b = html.find('"shortInterest":[{')
+      if idx_b > -1:
+        idx_e = html.find('],', idx_b)
+        if idx_e > -1:
+          json_txt = '[' + html[idx_b+17:idx_e+1]
+          df = pd.read_json(StringIO(json_txt), orient='records')
+          df['recordDate'] = pd.to_datetime(df['recordDate']).dt.strftime('%Y-%m-%d')
+          if 'shortPercentOfFloat' in df.columns:
+            rename_cols = {'recordDate': 'date', 'daysToCover': 'SR', 'shortPercentOfFloat': 'SF'}
+          else:
+            rename_cols = {'recordDate': 'date', 'daysToCover': 'SR'}
+            
+          df = df.rename(columns=rename_cols)[rename_cols.values()].tail(20)
 
-      selector = etree.HTML(r.text)
+          return_value = df.to_dict(orient='records')
 
-      results = selector.xpath("//table[@id='oMainTable']")
-      if len(results) > 0:
-        result = results[0]
-        titles = result.xpath("//tr[@id='oScrollHead']")
-
-        for idx, title in enumerate(titles):
-          if idx != 2:
-            result.remove(title)
-
-        for node in result.xpath('//*[@href]'):
-          href = node.get('href')
-          url_new = absolute_prefix + href
-          node.set('href', url_new)
-          node.set('target', '_blank')
-
-        for node in result.xpath('//*[@class or @id]'):
-          node.attrib.pop('class', None)  # None is to not raise an exception if xyz does not exist
-          node.attrib.pop('id', None)
-          #node.attrib.clear()   # Clear all attributes
-
-        # Workaround for eTree select script issue
-        tmp_html = etree.tostring(result, encoding='unicode', pretty_print=True).replace('&#13;\n', '\n    ').replace('券商分點-進出明細', '<a href="' + url_major + '" target="_blank">券商分點-進出明細</a>', 1)
-        tmp_html_end = tmp_html.index('</table>') + 8
-        stats += '  <div align="center">\n    ' + tmp_html[0:tmp_html_end] + '\n  </div>'
+  return return_value
 
 
-    # Handle 3 institutes
-    r = requests.get(url_inst, headers=headers, impersonate="chrome", timeout=5)
-    r.encoding = 'big5'
+
+
+################################################################################################################################################################
+def fetch_tw_financing_stats(ticker):
+  
+  return_value = {}
+  
+  if ".TW" in ticker:
+
+    url = f"{tw_sf_url}?no={ticker[:ticker.index('.')]}&m=mg"
+
+    r = requests.get(url, timeout=10, verify=False)
+    
     if r.status_code == 200:
-      selector = etree.HTML(r.text)
+      r.encoding = 'utf-8'
+      html = r.text
 
-      results = selector.xpath("//table[@class='t01']")
-      if len(results) > 0:
-        result = results[0]
-        titles = result.xpath("//tr[@id='oScrollHead']")
+      col_list = ["'融資餘額(張)'", "'融券餘額(張)'", "'借券賣出餘額(張)'"]
+      data_list = []
 
-        for idx, title in enumerate(titles):
-          if idx != 2:
-            result.remove(title)
+      for c in col_list:
+        idx_b = html.find(f"{c},\r\n") + len(c) + 1
+        if idx_b > (len(c) + 21):
+          idx_e = html.find(',\r\n', idx_b)
+          data = html[idx_b:idx_e].strip()
+          json_data = json.loads(data[6:])    # Remove 'data: ' and string to json list
+          data_list.append(json_data)
 
-        # Workaround for eTree select script issue
-        tmp_html = etree.tostring(result, encoding='unicode', pretty_print=True).replace('&#13;\n', '\n    ').replace('法人持股明細', '<a href="' + url_inst + '" target="_blank">法人持股明細</a>', 1)
-        tmp_html_end = tmp_html.index('</table>') + 8
-        stats += '\n  <br>\n  <div align="center">\n    ' + tmp_html[0:tmp_html_end] + '\n  <br>\n</div>'
-      
-      
-    # Handle stock news
-    r = requests.get(url_news, headers=headers, timeout=5, impersonate="chrome", verify=False)
-    r.encoding = 'big5'
-    if r.status_code == 200:
-      selector = etree.HTML(r.text)
+      dfs = [pd.DataFrame(l, columns=['date', col_list[i]]).set_index('date') for i, l in enumerate(data_list)]
+      if len(dfs) == 3:
+        df = pd.concat(dfs, axis=1)
+        df.index = pd.to_datetime(df.index, unit='ms').strftime('%Y-%m-%d')
+        df.rename(columns={"'融資餘額(張)'": "BB", "'融券餘額(張)'": "SB", "'借券賣出餘額(張)'": "LSB"}, inplace=True)
+  
+        df_reset = df.tail(BARS).reset_index()
+        return_value = df_reset.to_dict(orient='records')
 
-      results = selector.xpath("//table[@class='t01']")
-      if len(results) > 0:
-        result = results[0]
-        
-        for node in result.xpath('//*[@href]'):
-          href = node.get('href')
-          url_new = absolute_prefix + href
-          node.set('href', url_new)
-          node.set('target', '_blank')
-
-        for node in result.xpath('//*[@class or @id]'):
-          node.attrib.pop('class', None)  # None is to not raise an exception if xyz does not exist
-          node.attrib.pop('id', None)
-          #node.attrib.clear()   # Clear all attributes
-
-        # Workaround for eTree select script issue
-        tmp_html = etree.tostring(result, encoding='unicode', pretty_print=True).replace('&#13;\n', '\n    ').replace('動態報導', '<a href="' + url_news + '" target="_blank">動態報導</a>', 1)
-        stats += '\n  <br>\n  <div align="center">\n    ' + tmp_html.replace('width="100%"', 'width="50%"', 1) + '\n  <br>\n</div>'
-
-    print_time_delta(time(), "[FBS] " + url_overview + " | " + url_major + " | " + url_inst + " | " + url_news)
-           
-    return stats      
-    
-  elif token.find('^TW') == 0:
-    print_time_delta_start = time()
-    index_iframe = '<div align="center">\n    <a href="https://fubon-ebrokerdj.fbs.com.tw/z/zb/zba/zba.djhtm" target="_blank">資金流向</a><br><br>\n<iframe src="https://jpc.moneydj.com/z/skv.djhtm?ASPID=sysjust&showAll=1&overlay=0&showTable=1&showLogo=0&w=600&h=600" width="600" height="600" frameborder="0" scrolling="no"></iframe>\n  </div>'
-    print_time_delta(time(), "[FBS] Taiwan Index")
-    
-    return index_iframe
-    
-  else:
-    return ''
+  return return_value
 
 
 
 
-def report_get_position_pyramid(token):
-
+################################################################################################################################################################
+def fetch_symbol_name(ticker):
+  
+  return_value = ""
+  
   headers = {
-    'authority': 'norway.twsthr.info',
+    'authority': 'query1.finance.yahoo.com',
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'accept-language': 'zh-TW,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6',
     'cache-control': 'max-age=0',
-    'referer': 'https://norway.twsthr.info/StockHolders.aspx',
-    'sec-ch-ua': '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+    'sec-ch-ua': '"Google Chrome";v="117", "Not;A=Brand";v="8", "Chromium";v="117"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'document',
     'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'same-origin',
+    'sec-fetch-site': 'none',
     'sec-fetch-user': '?1',
     'upgrade-insecure-requests': '1',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
   }
   
-  html = ''
+  url = 'https://tw.stock.yahoo.com/_td-stock/api/resource/StockServices.stockList;symbols=' + ticker
+  r = requests.get(url, headers=headers, timeout=5)
 
-  if token.find('.TW') > 0:
-    print_time_delta_start = time()
-    params = {'stock': token[0:token.index('.TW')]}
+  if r.status_code == 200:
+    yahoo_tw = r.json()
+    return_value = yahoo_tw[0]['symbolName']
 
-    r = requests.get('https://norway.twsthr.info/StockHolders.aspx', params=params, headers=headers, verify=False, impersonate="chrome", timeout=5)
-    #print(r.text)
+  return return_value
+
+
+
+################################################################################################################################################################
+def simplified_options(stock):
+  result = []
+  for date in stock.options:
+    opt = stock.option_chain(date)
+    for opt_type, label in zip(['calls', 'puts'], ['call', 'put']):
+      df = getattr(opt, opt_type)
+      df = df.copy()
+      df['premium_est'] = df['lastPrice'] * df['volume'] * 100
+      filtered = df[df['premium_est'] > 200_000]
+      for _, row in filtered.iterrows():
+        result.append({
+          'date': date,
+          'type': label,
+          'strike': round(row['strike'], 4),
+          'lastPrice': round(row['lastPrice'], 4),
+          'volume': round(row['volume'], 4),
+          'openInterest': round(row['openInterest'], 4),
+          'premiumEstimated': round(row['premium_est'], 4),
+          'inTheMoney': bool(row['inTheMoney'])
+        })
+  return result
+
+
+
+
+################################################################################################################################################################
+def fetch_stock_data(ticker):
+  close = 'Close'
+  MA_TYPE = 0
+  
+  stock = yf.Ticker(ticker)
+  hist = stock.history(period="2y", auto_adjust=True)        
+  hist['ATR'] = talib.ATR(hist['High'], hist['Low'], hist['Close'], timeperiod=5)
+  
+  hist.drop(['Open', 'High', 'Low', 'Stock Splits'], axis=1, inplace=True, errors='ignore')
+  gc.collect()
+
+  hist['10MA'] = talib.SMA(hist[close], timeperiod=10)
+  hist['20MA'] = talib.SMA(hist[close], timeperiod=20)
+  #hist['60MA'] = talib.SMA(hist[close], timeperiod=60)
+  hist['200MA'] = talib.SMA(hist[close], timeperiod=200)  
+  hist['BBU'], hist['60MA'], hist['BBD'] = talib.BBANDS(hist[close].values, timeperiod=60, nbdevup=2, nbdevdn=2, matype=MA_TYPE)    
+  hist['RSI'] = talib.RSI(hist[close], timeperiod=14)
+  hist['MACD'], hist['MACD Signal'], hist['MACDH'] = talib.MACD(hist[close], fastperiod=50, slowperiod=120, signalperiod=30)
+  
+  hist.drop(['MACD', 'MACD Signal'], axis=1, inplace=True)
+  gc.collect()
+  
+  # Calculate the difference between closing price and 200MA
+  hist['200MA Diff'] = (hist[close]-hist['200MA'])/hist['200MA']*100
+
+  # Calculate the mean and standard deviation of the differences
+  mean_diff = hist['200MA Diff'].mean()
+  std_diff = hist['200MA Diff'].std()
+
+  # Calculate the z-score
+  hist['200MADZ'] = (hist['200MA Diff'] - mean_diff) / std_diff
+  
+  hist.drop(['200MA Diff'], axis=1, inplace=True)
+  gc.collect()
+  
+  hist = hist.round(2)
+  hist = hist.reset_index().tail(BARS)
+  hist['Date'] = pd.to_datetime(hist['Date']).dt.strftime('%Y-%m-%d')
+  
+  #print(hist)
+  
+  hist_dict = hist.to_dict(orient="records")
+  
+  financials = stock.financials.to_dict()
+  quarterly_financials = stock.quarterly_financials.to_dict()
+  cash_flow = stock.cash_flow.to_dict()
+  quarterly_cashflow = stock.quarterly_cashflow.to_dict()
+  #info = stock.info
+  info = dict(dropwhile(lambda item: item[0] != 'previousClose', stock.info.items()))
+  print(info)
+  
+  upgrades_downgrades = stock.upgrades_downgrades[:10].to_dict()
+  eps_trend = stock.eps_trend.to_dict()
+  revenue_estimate = stock.revenue_estimate.to_dict()
+  
+  """
+  options = stock.options[:8]
+  options_data = {}
+  for date in options:
+    opt = stock.option_chain(date)
+    options_data[date] = {
+      "calls": opt.calls.round(4).to_dict(orient="records"),
+      "puts": opt.puts.round(4).to_dict(orient="records")
+    }
+  """
+  options_data = simplified_options(stock)
+  
+  gc.collect()
+  
+  return {
+    "symbol_name": fetch_symbol_name(ticker),
+    "history": hist_dict,
+    "financials": financials,
+    "quarterly_financials": quarterly_financials,
+    "cash_flow": cash_flow,
+    "quarterly_cashflow": quarterly_cashflow,
+    "info": info,
+    "upgrades_downgrades": upgrades_downgrades,
+    "eps_trend": eps_trend,
+    "revenue_estimate": revenue_estimate,
+    "options": options_data,
+    "mainforce_tw": fetch_tw_whale(ticker),
+    "short_stats": fetch_short_stats(ticker),
+    "securities_financing_tw": fetch_tw_financing_stats(ticker)
+  }
+
+
+
+
+################################################################################################################################################################
+def ollama_generate(prompt, model='llama3'):
+  print(f"Use Ollama: {model}")
+  
+  headers = {
+    "Content-Type": "application/json"
+  }
+
+  data = {
+    "model": model,  # 請確認這個模型已經在本地 ollama 中存在
+    "messages": [
+      {
+        "role": "user",
+        "content": prompt
+      }
+    ],
+    "stream": False  # 若設為 True，會變成 stream 回傳
+  }
+ 
+  url = "http://localhost:11434/api/chat"
+  response = requests.post(url, headers=headers, data=json.dumps(data), timeout=600)
+  
+  if response.status_code == 200:
+    result = response.json()
+    return(result["message"]["content"])
+  else:
+    print(f"❌ Ollama error：{response.status_code}")
+    print(response.text)
+
+
+
+
+################################################################################################################################################################
+def gemini_generate_content(prompt, model_name, api_key, use_search=True):
+  url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+  headers = {
+    "Content-Type": "application/json",
+    "x-goog-api-key": api_key
+  }
+  
+  data = {
+    "contents": [
+       {
+         "parts": [
+           {"text": prompt}
+         ]
+       }
+    ]
+  }
+
+  if use_search:
+    data["tools"] = [
+       {
+         "google_search": {}
+       }
+    ]
+
+  response = requests.post(url, headers=headers, json=data, timeout=600)
+  if response.status_code == 200:
+    result = response.json()
+    # 取出回應內容
+    #return result['candidates'][0]['content']['parts'][0]['text']
+    
+    # ★ 修正 2：整合所有 parts 的文字
+    try:
+      if 'candidates' in result and result['candidates']:
+          content = result['candidates'][0].get('content', {})
+          parts = content.get('parts', [])
+          
+          # 使用 join 將所有 part 的 text 串接起來
+          full_text = "".join([part.get('text', '') for part in parts])
+          
+          return full_text
+      else:
+          return "No candidates returned."
+            
+    except (KeyError, IndexError) as e:
+      return f"Error parsing response: {e}"
+  
+  else:
+    raise Exception(f"❌ Gemini API error: {response.status_code} {response.text}")
+
+
+
+
+################################################################################################################################################################
+def dict_to_table(data: list[dict], limit=200, csv=True) -> str:
+  if not data:
+    return "無資料"
+  df = pd.DataFrame(data).tail(limit)
+  if csv:
+    return df.to_csv(index=False)
+  else:
+    return df.to_string(index=False)
+
+
+
+
+################################################################################################################################################################
+def dict_to_table_finance(data: list[dict], csv=True) -> str:
+  if not data:
+    return "無資料"
+  df = pd.DataFrame(data)
+  
+  if csv:
+    return df.to_csv(index=True)
+  else:
+    return df.to_string(index=True)
+
+
+
+
+################################################################################################################################################################
+@app.route('/aia/', methods=['GET', 'POST'])
+def gemini_analysis():
+  gc.collect()
+  
+  analysis = None
+  error = None
+  ticker = ''
+  model_name = 'gemini-2.5-flash'  # 預設值
+
+  if request.method == 'POST':
+    ticker = request.form.get('ticker', '').strip()
+    additional_prompt = request.form.get('additional_prompt', '').strip()
+    model_name = request.form.get('model', 'gemini-2.5-flash')
+    
+    if not ticker:
+      error = "請輸入股票代碼"
+    else:
+      try:
+        stock_data = fetch_stock_data(ticker)
+        symbol_name = stock_data['symbol_name']
+        history_table = dict_to_table(stock_data['history'])
+        mf_tw_table = dict_to_table(stock_data['mainforce_tw'])
+        short_table = dict_to_table(stock_data['short_stats'])
+        sf_tw_table = dict_to_table(stock_data['securities_financing_tw'])
+        financials_table = dict_to_table_finance(stock_data['financials'])
+        financials_q_table = dict_to_table_finance(stock_data['quarterly_financials'])
+        cashflow_table = dict_to_table_finance(stock_data['cash_flow'])
+        cashflow_q_table = dict_to_table_finance(stock_data['quarterly_cashflow'])
+        #info_table = dict_to_table_finance(stock_data['info'])
+        updown_table = dict_to_table_finance(stock_data['upgrades_downgrades'])
+        eps_trend_table = dict_to_table_finance(stock_data['eps_trend'])
+        revenue_estimate_table = dict_to_table_finance(stock_data['revenue_estimate'])
+        option_table = dict_to_table_finance(stock_data['options'])
+
+        gc.collect()
+       
+        print('----------------------------------------')
+        prompt = f"""
+你是一個資深的華爾街分析師，擅長從基本面技術面籌碼面產生股票分析報告。請根據 {symbol_name} ({ticker}) 的下列資料進行分析並產生一份繁體中文個股分析報告，首先用簡單的語言解釋這家公司的業務：它解決什麼問題，誰為此付費，為什麼客戶選擇它而不是替代品。
+分解這家公司的收入流：哪些部門在增長，哪些在放緩，公司對頂級產品或客戶的依賴程度如何？解釋這家公司所在的行業：市場是在增長、穩定還是萎縮？什麼長期趨勢有利或不利於該業務？列出主要競爭對手：比較他們的定價權、產品實力、規模和競爭壁壘，突出這家公司明顯勝出或落後的地方。
+然後從網路上搜尋近半年公司相關新聞並以表格方式總結其對股價與經營業務的影響，然後列出目前價格與關鍵支持價位，以及根據財報預測數據所推算的未來股價，內容包含基本面 (數字要有YoY加減速的分析，重點關注收入增長一致性、利潤率、債務水平、自由現金流強度和資本配置。並且根據年度財報預估與當季累積財報數字，預估後面一兩季的營收獲利起伏與對應的PE/PS/PB ratio，並且以表格列出每季EPS與營收增減的速度與加速度)、技術面 (配合成交量分析，例如是否有價量背離或技術指標與股價背離，或是型態上有破底翻、假突破、杯柄型態、上升旗型、下降旗型，或是 Mark Minervini 所提出的 Volatility Contraction Pattern 等典型股價走勢型態) 與期權市場的觀察與建議。 若mf_tw_table資料中有台灣股市主力當日買賣超 (mf)，主力買賣超累積 (mf_acc)，買賣家差數 (b_s)，順便分析主力吃或出貨狀況。若資料中short_table有值，根據SF (short floating) 與SR (short ratio) 分析市場空單狀況及嘎空可能性。若資料中有台灣股市 (sf_tw_table) 融資餘額 (BB)， 融券餘額 (SB)， 借券賣出餘額 (LSB)，分析市場空單狀況，嘎空可能性以及未來主力操作方向。
+接下來，識別這家公司的最大風險。包括業務風險、財務風險、監管威脅和可能永久性傷害業務的因素，評估管理團隊的歷史表現。他們過去執行情況如何？他們的決策如何影響長期股東？
+{additional_prompt}
+最後，根據上述的所有分析，總結你的投資建議。
+
+[技術面]
+csv table 欄位縮寫: MACD Histogram (MACDH)， 60MA Bollinger Band (BBU， BBD)， 200MA Diff Z-Score (200MADZ)
+{history_table}
+
+[台股主力籌碼]
+csv table 欄位縮寫: 主力當日買賣超 (mf)，主力買賣超累積 (mf_acc)，買賣家差數 (b_s)
+{mf_tw_table}
+
+[台股融資融券與借券賣出餘額]
+csv table 欄位縮寫: 融資餘額 (BB)， 融券餘額 (SB)， 借券賣出餘額 (LSB)
+{sf_tw_table}
+
+[空單狀況]
+csv table 欄位縮寫: SF (short floating)， SR (short ratio)
+{short_table}
+
+[財報資料]
+###
+公司概況:
+{stock_data['info']}
+
+###
+年度財報: csv table 
+{financials_table}
+
+###
+季度財報: csv table 
+{financials_q_table}
+
+###
+年度現金流: csv table 
+{cashflow_table}
+
+###
+季度現金流: csv table 
+{cashflow_q_table}
+
+###
+EPS年度趨勢: csv table 
+{eps_trend_table}
+
+###
+營收預估: csv table 
+{revenue_estimate_table}
+
+###
+評等變化: csv table 
+{updown_table}
+
+
+[期權市場]
+csv table
+{option_table}
+        """
+        print(prompt)
+        print('----------------------------------------')
+
+        if use_ollama == True:
+          analysis = ollama_generate(prompt, model=ollama_model)
+        else:
+          #import google.generativeai as genai
+          #genai.configure(api_key=api_key)
+          #model = genai.GenerativeModel(model_name)
+          #response = model.generate_content(prompt)
+          #analysis = response.text
+
+          # Auto-detect if search should be used (disable for thinking/reasoning models)
+          use_search = "thinking" not in model_name.lower() and "reasoning" not in model_name.lower()
+          if model_name == 'gemini-2.5-flash':
+            use_search = True
+          else:
+            use_search = False
+          analysis = gemini_generate_content(prompt, model_name, api_key, use_search=use_search)
+      except Exception as e:
+        error = f"分析過程發生錯誤: {e}"
+
+  return render_template('analysis.html', analysis=analysis, error=error, ticker=ticker, model=model_name)
+
+
+
+
+################################################################################################################################################################
+@app.route('/suityourself/', methods=['GET', 'POST'])
+def gemini_analysis_user():
+    gc.collect()
+    analysis = None
+    error = None
+    ticker = ''
+    model_name = 'gemini-2.5-pro'
+
+    if request.method == 'POST':
+        ticker = request.form.get('ticker', '').strip()
+        additional_prompt = request.form.get('additional_prompt', '').strip()
+        model_name = request.form.get('model', 'gemini-2.5-pro')
+        gemini_key = request.form.get('gemini_key', '').strip()
+
+        if not ticker:
+            error = "請輸入股票代碼"
+        elif not gemini_key:
+            error = "請輸入有效的 Gemini API Key"
+        else:
+            try:
+                # 假設 fetch_stock_data 和 gemini_generate_content 已定義
+                stock_data = fetch_stock_data(ticker)
+                symbol_name = stock_data['symbol_name']
+                history_table = dict_to_table(stock_data['history'])
+                mf_tw_table = dict_to_table(stock_data['mainforce_tw'])
+                short_table = dict_to_table(stock_data['short_stats'])
+                sf_tw_table = dict_to_table(stock_data['securities_financing_tw'])
+                financials_table = dict_to_table_finance(stock_data['financials'])
+                financials_q_table = dict_to_table_finance(stock_data['quarterly_financials'])
+                cashflow_table = dict_to_table_finance(stock_data['cash_flow'])
+                cashflow_q_table = dict_to_table_finance(stock_data['quarterly_cashflow'])
+                #info_table = dict_to_table_finance(stock_data['info'])
+                updown_table = dict_to_table_finance(stock_data['upgrades_downgrades'])
+                eps_trend_table = dict_to_table_finance(stock_data['eps_trend'])
+                revenue_estimate_table = dict_to_table_finance(stock_data['revenue_estimate'])
+                option_table = dict_to_table_finance(stock_data['options'])
+
+                gc.collect()
+               
+                print('----------------------------------------')
+                prompt = f"""
+你是一個資深的華爾街分析師，擅長從基本面技術面籌碼面產生股票分析報告。請根據 {symbol_name} ({ticker}) 的下列資料進行分析並產生一份繁體中文個股分析報告，首先用簡單的語言解釋這家公司的業務：它解決什麼問題，誰為此付費，為什麼客戶選擇它而不是替代品。
+分解這家公司的收入流：哪些部門在增長，哪些在放緩，公司對頂級產品或客戶的依賴程度如何？解釋這家公司所在的行業：市場是在增長、穩定還是萎縮？什麼長期趨勢有利或不利於該業務？列出主要競爭對手：比較他們的定價權、產品實力、規模和競爭壁壘，突出這家公司明顯勝出或落後的地方。
+然後從網路上搜尋近半年公司相關新聞並以表格方式總結其對股價與經營業務的影響，然後列出目前價格與關鍵支持價位，以及根據財報預測數據所推算的未來股價，內容包含基本面 (數字要有YoY加減速的分析，重點關注收入增長一致性、利潤率、債務水平、自由現金流強度和資本配置。並且根據年度財報預估與當季累積財報數字，預估後面一兩季的營收獲利起伏與對應的PE/PS/PB ratio，並且以表格列出每季EPS與營收增減的速度與加速度)、技術面 (配合成交量分析，例如是否有價量背離或技術指標與股價背離，或是型態上有破底翻、假突破、杯柄型態、上升旗型、下降旗型，或是 Mark Minervini 所提出的 Volatility Contraction Pattern 等典型股價走勢型態) 與期權市場的觀察與建議。 若mf_tw_table資料中有台灣股市主力當日買賣超 (mf)，主力買賣超累積 (mf_acc)，買賣家差數 (b_s)，順便分析主力吃或出貨狀況。若資料中short_table有值，根據SF (short floating) 與SR (short ratio) 分析市場空單狀況及嘎空可能性。若資料中有台灣股市 (sf_tw_table) 融資餘額 (BB)， 融券餘額 (SB)， 借券賣出餘額 (LSB)，分析市場空單狀況，嘎空可能性以及未來主力操作方向。
+接下來，識別這家公司的最大風險。包括業務風險、財務風險、監管威脅和可能永久性傷害業務的因素，評估管理團隊的歷史表現。他們過去執行情況如何？他們的決策如何影響長期股東？
+{additional_prompt}
+最後，根據上述的所有分析，總結你的投資建議。
+
+[技術面]
+csv table 欄位縮寫: MACD Histogram (MACDH)， 60MA Bollinger Band (BBU， BBD)， 200MA Diff Z-Score (200MADZ)
+{history_table}
+
+[台股主力籌碼]
+csv table 欄位縮寫: 主力當日買賣超 (mf)，主力買賣超累積 (mf_acc)，買賣家差數 (b_s)
+{mf_tw_table}
+
+[台股融資融券與借券賣出餘額]
+csv table 欄位縮寫: 融資餘額 (BB)， 融券餘額 (SB)， 借券賣出餘額 (LSB)
+{sf_tw_table}
+
+[空單狀況]
+csv table 欄位縮寫: SF (short floating)， SR (short ratio)
+{short_table}
+
+[財報資料]
+###
+公司概況:
+{stock_data['info']}
+
+###
+年度財報: csv table 
+{financials_table}
+
+###
+季度財報: csv table 
+{financials_q_table}
+
+###
+年度現金流: csv table 
+{cashflow_table}
+
+###
+季度現金流: csv table 
+{cashflow_q_table}
+
+###
+EPS年度趨勢: csv table 
+{eps_trend_table}
+
+###
+營收預估: csv table 
+{revenue_estimate_table}
+
+###
+評等變化: csv table 
+{updown_table}
+
+
+[期權市場]
+csv table
+{option_table}
+"""
+                print(prompt)
+                print('----------------------------------------')
+                use_search = "thinking" not in model_name.lower() and "reasoning" not in model_name.lower()
+                analysis = gemini_generate_content(prompt, model_name, gemini_key, use_search=use_search)
+            except Exception as e:
+                error = f"分析過程發生錯誤: {e}"
+
+    return render_template('analysis_user.html', analysis=analysis, error=error, ticker=ticker, model=model_name)
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+def rewrite_html(html, base_url):
+  # 將 src/href 內的絕對或相對路徑改寫成 proxy 路徑
+  def repl(match):
+    orig_url = match.group(2)
+    # 處理相對路徑
+    if not orig_url.startswith('http'):
+      from urllib.parse import urljoin
+      orig_url = urljoin(base_url, orig_url)
+    return f'{match.group(1)}/proxy?url={orig_url}{match.group(3)}'
+
+  # 只處理 src 和 href
+  pattern = r'((?:src|href)=["\'])([^"\']+)(["\'])'
+  return re.sub(pattern, repl, html, flags=re.IGNORECASE)
+
+
+
+
+################################################################################################################################################################
+@app.route('/proxy')
+def proxy():
+  target_url = request.args.get('url')
+  if not target_url:
+    return "請提供 ?url= 參數", 400
+
+  try:
+    resp = requests.get(target_url, headers={
+      'User-Agent': request.headers.get('User-Agent', 'Mozilla/5.0')
+    }, timeout=10)
+    content_type = resp.headers.get('Content-Type', '')
+
+    if 'text/html' in content_type:
+      # 只重寫 HTML
+      html = resp.text
+      html = rewrite_html(html, target_url)
+      return Response(html, status=resp.status_code, content_type=content_type)
+    else:
+      # 其他資源直接回傳
+      return Response(resp.content, status=resp.status_code, content_type=content_type)
+
+  except Exception as e:
+      return f"Error: {e}", 500
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+no_list = list(range(1, 29660))
+random.shuffle(no_list)
+no_index = 0
+
+
+
+
+################################################################################################################################################################
+@app.route('/hokkien/')
+def hokkien():
+  return render_template('hokkien.html')
+
+
+
+
+################################################################################################################################################################
+def replace_button_with_audio(html):
+  # 用 re 找出 button 的 data-src
+  def repl(m):
+    audio_url = m.group(1)
+    # 你可以自訂 audio 樣式，這裡用 controls 會有原生播放icon
+    return f'''
+    <audio controls style="vertical-align: middle; height: 20px width: 20px;">
+        <source src="{audio_url}" type="audio/mpeg">
+        您的瀏覽器不支援音訊播放。
+    </audio>
+      '''
+  # 把 button 換成 audio
+  new_html = re.sub(
+    r'<button[^>]*data-src="([^"]+)"[^>]*>.*?</button>',
+    repl,
+    html,
+    flags=re.S
+  )
+  return new_html
+
+
+
+
+################################################################################################################################################################
+@app.route('/api/random')
+def hokkien_random_word():
+  global no_index, no_list
+  max_retry = 10
+  base_url = 'https://sutian.moe.edu.tw/'
+  
+  for _ in range(max_retry):
+    # 取下一個不重複的 no
+    if no_index >= len(no_list):
+      random.shuffle(no_list)
+      no_index = 0
+    no = no_list[no_index]
+    no_index += 1
+
+    url = f'https://sutian.moe.edu.tw/zh-hant/su/{no}/'
+    try:
+      resp = requests.get(url,  timeout=5, verify=False)
+    except Exception:
+      continue
+   
+    if resp.status_code != 200:
+      continue
+
+    html = resp.text
+
+    # 找到 div.row.justify-content-center
+    match = re.search(r'<div class="row justify-content-center".*?</div>\s*</div>', html, re.S)
+    if not match:
+      continue
+    div_html = match.group(0)
+
+    # 補上 <a> 的完整網址
+    #div_html = re.sub(
+    #  r'href="(?!http)([^"]+)"',
+    #  lambda m: f'href="{urljoin(base_url, m.group(1).lstrip("/"))}"',
+    #  div_html
+    #)
+    
+    div_html = re.sub(
+      r'href="(?!http)([^"]+)"',
+      lambda m: (
+        f'href="{m.group(1)}"' if m.group(1).startswith('#')
+        else f'href="{urljoin(base_url, m.group(1).lstrip("/"))}"'
+      ),
+      div_html
+    )
+
+    # 補上 <img> 的完整網址
+    div_html = re.sub(
+      r'src="(?!http)([^"]+)"',
+      lambda m: f'src="{urljoin(base_url, m.group(1).lstrip("/"))}"',
+      div_html
+    )
+
+    # 找出 button 的 data-src
+    button_match = re.search(r'<button[^>]*data-src="([^"]+)"', div_html)
+    audio_url = urljoin(base_url, button_match.group(1)) if button_match else ''
+
+    # 補上 <button> 的完整 data-src
+    div_html = re.sub(
+      r'data-src="(?!http)([^"]+)"',
+      lambda m: f'data-src="{urljoin(base_url, m.group(1).lstrip("/"))}"',
+      div_html
+    )
+
+    div_html = replace_button_with_audio(div_html)
+
+    return jsonify({'no': no, 'html': div_html, 'audio_url': audio_url})
+
+  # 如果10次都沒找到
+  return jsonify({'no': None, 'html': '<div>查無資料</div>', 'audio_url': ''})
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+def generate_option_tabs(ticker: str):
+  stock = yf.Ticker(ticker)
+  expirations = stock.options
+
+  tab = Tab()
+  all_options_list = []
+
+  for expiry in expirations:
+    try:
+      opt_chain = stock.option_chain(expiry)
+      calls = opt_chain.calls
+      puts = opt_chain.puts
+    except Exception:
+      continue
+
+    # 計算 premium
+    calls["premium_est"] = calls["lastPrice"] * calls["volume"] * 100
+    puts["premium_est"] = puts["lastPrice"] * puts["volume"] * 100
+
+    options = pd.concat([calls.assign(type="Call"), puts.assign(type="Put")])
+    options["expiry"] = expiry
+
+    # 過濾條件
+    options = options[(options["volume"] > 0) & (options["premium_est"] > 200_000)]
+    if options.empty:
+        continue
+
+    options["premium_K"] = options["premium_est"] / 1000
+    options = options.sort_values(by="premium_K", ascending=False)
+
+    all_options_list.append(options)
+
+    # 繪圖
+    contracts = options["contractSymbol"].tolist()
+    premiums = options["premium_K"].round(1).tolist()
+    color_list = ["#FF4C4C" if t=="Call" else "#2ECC71" for t in options["type"]]
+
+    bar = (
+      Bar(init_opts=opts.InitOpts(width="1280px", height="720px"))
+      .add_xaxis(contracts)
+      .add_yaxis("Premium (K USD)", premiums,
+                 #itemstyle_opts=opts.ItemStyleOpts(color="auto"),
+                 itemstyle_opts=opts.ItemStyleOpts(color=JsCode("""
+                    function(params) {
+                      var colors = %s;
+                      return colors[params.dataIndex];
+                    }
+                    """ % color_list)
+                 ),
+                 label_opts=opts.LabelOpts(is_show=True, position="top"))
+      .set_global_opts(
+        title_opts=opts.TitleOpts(title=f"{ticker.upper()} Options (Expiry {expiry})"),
+        xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45, font_size=8)),
+        yaxis_opts=opts.AxisOpts(name="Premium (K USD)"),
+      )
+    )
+
+    tab.add(bar, expiry)
+
+  # 總覽 tab
+  if all_options_list:
+    all_options = pd.concat(all_options_list)
+    all_top10 = all_options.sort_values(by="premium_K", ascending=False).head(10)
+
+    contracts = (all_top10["contractSymbol"] + " (" + all_top10["expiry"] + ")").tolist()
+    premiums = all_top10["premium_K"].round(1).tolist()
+    color_list = ["#FF4C4C" if t=="Call" else "#2ECC71" for t in all_top10["type"]]
+
+    overview_bar = (
+      Bar(init_opts=opts.InitOpts(width="1280px", height="720px"))
+      .add_xaxis(contracts)
+      .add_yaxis("Premium (K USD)", premiums,
+                 #itemstyle_opts=opts.ItemStyleOpts(color="auto"),
+                 itemstyle_opts=opts.ItemStyleOpts(color=JsCode("""
+                    function(params) {
+                      var colors = %s;
+                      return colors[params.dataIndex];
+                    }
+                    """ % color_list)
+                 ),
+                 label_opts=opts.LabelOpts(is_show=True, position="top"))
+      .set_global_opts(
+        title_opts=opts.TitleOpts(title=f"{ticker.upper()} Options Overview (Top 10 Premium)"),
+        xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45, font_size=8)),
+        yaxis_opts=opts.AxisOpts(name="Premium (K USD)"),
+      )
+    )
+    
+    tab.add(overview_bar, "Overview")
+
+  return tab.render_embed()
+
+
+
+
+################################################################################################################################################################
+@app.route("/optionpremium/", methods=["GET", "POST"])
+def optionpremium():
+  chart_html = None
+  ticker = None
+  if request.method == "POST":
+    ticker = request.form.get("ticker")
+    if ticker:
+      chart_html = generate_option_tabs(ticker)
+
+  return render_template("optionpremium.html", chart_html=chart_html, ticker=ticker)
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+def get_stock_data(ticker, start_date, end_date, session, crumb="F7GXvns0Eji"):
+
+  start_epoch = int(datetime.combine(start_date, datetime.min.time()).timestamp())
+  end_epoch = int(datetime.combine(end_date, datetime.min.time()).timestamp())
+  url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={start_epoch}&period2={end_epoch}&interval=1d&events=history&includeAdjustedClose=true&events=div%2Csplits&crumb={crumb}"
+  
+  headers = {'user-agent': 'Mozilla/5.0'}
+  r = session.get(url, headers=headers, timeout=5)
+  r.raise_for_status()
+  data = r.json()
+  result = data["chart"]["result"][0]
+  quote = result["indicators"]["quote"][0]
+  adjclose = result["indicators"]["adjclose"][0]["adjclose"]
+  df = pd.DataFrame({
+    "Date": pd.to_datetime(result["timestamp"], unit='s'),
+    "Open": quote["open"],
+    "High": quote["high"],
+    "Low": quote["low"],
+    "Close": quote["close"],
+    "Adj Close": adjclose,
+    "Volume": quote["volume"]
+  }).set_index("Date")
+  df.name = ticker
+  return df
+
+
+
+
+################################################################################################################################################################
+def calculate_variation(df):
+  
+  df['Adj Close Var'] = (df['Adj Close'] / df['Adj Close'].iloc[0]) * 100
+  return df
+
+
+
+
+################################################################################################################################################################
+def align_dataframes(dfs):
+  
+  min_len = min(len(df) for df in dfs)
+  base_index = min(range(len(dfs)), key=lambda i: len(dfs[i]))
+  base_dates = dfs[base_index].index
+  for i, df in enumerate(dfs):
+    if len(df) != min_len:
+      dfs[i] = df.reindex(base_dates, method='ffill')
+      dfs[i].name = df.name
+  return dfs, base_index
+
+
+
+
+################################################################################################################################################################
+def compute_beta(df1, df2):
+  m = df1['Adj Close'].pct_change().dropna()
+  t = df2['Adj Close'].pct_change().dropna()
+  min_len = min(len(m), len(t))
+  m, t = m[-min_len:], t[-min_len:]
+  cov = np.cov(m, t)[0][1]
+  var = np.var(m)
+  return cov / var if var != 0 else np.nan
+
+
+
+
+################################################################################################################################################################
+@app.route('/compare', methods=['GET', 'POST'])
+def compare():
+  
+  if request.method == 'POST':
+    tickers = request.form.get('tickers')
+    days = int(request.form.get('days', 1800))
+  else:
+    tickers = request.args.get('tickers')
+    days = int(request.args.get('days', 1800))
+    
+  if not tickers:
+    return "Please provide tickers parameter, e.g. ?tickers=AAPL,MSFT", 400
+  tickers = [t.strip() for t in tickers.replace(' ', ',').split(',') if t.strip()]
+  if len(tickers) < 1:
+    return "Please provide at least one ticker.", 400
+
+  today = date.today()
+  start_date = today - timedelta(days=days)
+  session = requests.Session(impersonate="chrome")
+ 
+  stock_dfs = []
+  errors = []
+  for ticker in tickers:
+    try:
+      df = get_stock_data(ticker, start_date, today, session)
+      df = calculate_variation(df)
+      stock_dfs.append(df)
+    except Exception as e:
+      errors.append(f"{ticker}: {e}")
+
+  if not stock_dfs:
+    return "No data fetched.<br>" + "<br>".join(errors), 500
+
+  stock_dfs, base_idx = align_dataframes(stock_dfs)
+
+  # Calculate beta
+  beta_dict = {}
+  base_df = stock_dfs[0]
+  for i in range(1, len(stock_dfs)):
+    beta_value = compute_beta(base_df, stock_dfs[i])
+    beta_dict[stock_dfs[i].name] = beta_value
+
+  # Beta string
+  beta_str = "\n".join([f"{name} / {base_df.name}: β={beta_value:.2f}" for name, beta_value in beta_dict.items()])
+
+  # Stats string
+  stats_string = ""
+  for df in stock_dfs:
+    stats_string += f'{df.name}: δ={df["Adj Close Var"].iloc[-1] - df["Adj Close Var"].iloc[0]:5.2f}%, σ={df["Adj Close Var"].std():5.2f}%\n'
+  
+  # Plot
+  line = Line(init_opts=opts.InitOpts(page_title=" vs ".join(tickers), height='900px', width='1880px'))
+  dates = stock_dfs[base_idx].index.strftime('%Y%m%d').tolist()
+  line.add_xaxis(xaxis_data=dates)
+  for df in stock_dfs:
+    line.add_yaxis(
+      series_name=df.name,
+      y_axis=df["Adj Close Var"].map('{:.2f}'.format).tolist(),
+      is_smooth=False,
+      is_symbol_show=False,
+      is_hover_animation=False,
+      linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.9)
+    )
+  
+  line.set_global_opts(
+    xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(font_size=10)),
+    yaxis_opts=opts.AxisOpts(is_scale=False, splitarea_opts=opts.SplitAreaOpts(is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=0.5))),
+    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross", textstyle_opts=opts.TextStyleOpts(font_size=12)),
+    legend_opts=opts.LegendOpts(textstyle_opts=opts.TextStyleOpts(font_size=12)),
+    datazoom_opts=[
+      opts.DataZoomOpts(is_show=False, type_="inside", xaxis_index=[0], range_start=0, range_end=100, is_realtime=False),
+      opts.DataZoomOpts(is_show=True, xaxis_index=[0], type_="slider", pos_top="98%", range_start=0, range_end=100, is_realtime=False),
+    ],
+    title_opts=opts.TitleOpts(
+      title=stats_string,
+      subtitle=beta_str,  # beta in subtitle
+      pos_left='10%',
+      pos_top='10%',
+      title_textstyle_opts=opts.TextStyleOpts(font_size=12),
+      subtitle_textstyle_opts=opts.TextStyleOpts(font_size=12)
+    ),
+    toolbox_opts=opts.ToolboxOpts(is_show=True, feature={"dataZoom": {"yAxisIndex": "none"}, "restore": {}, "saveAsImage": {}}),
+  )
+
+  # Return HTML
+  return line.render_embed()
+
+
+
+
+################################################################################################################################################################
+@app.route('/performance/', methods=['GET'])
+def performance_diff():
+  return '''
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+      <meta charset="UTF-8">
+      <title>Stock Compare</title>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+      <style>
+          body {
+              background: #f8f9fa;
+          }
+          .container {
+              max-width: 600px;
+              margin-top: 80px;
+              background: #fff;
+              border-radius: 12px;
+              box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+              padding: 32px 32px 24px 32px;
+          }
+          .form-label {
+              font-weight: 500;
+          }
+          .btn-primary {
+              width: 100%;
+              font-size: 1.1rem;
+              padding: 10px;
+          }
+          h2 {
+              text-align: center;
+              margin-bottom: 32px;
+              font-weight: 700;
+              color: #2c3e50;
+          }
+      </style>
+  </head>
+  <body>
+      <div class="container">
+          <h2>Stock Performance Comparison</h2>
+          <form action="/compare" method="post">
+              <div class="mb-3">
+                  <label for="tickers" class="form-label">Tickers (comma separated):</label>
+                  <input type="text" class="form-control" id="tickers" name="tickers" value="^GSPC,AAPL" required>
+              </div>
+              <div class="mb-3">
+                  <label for="days" class="form-label">Days:</label>
+                  <input type="number" class="form-control" id="days" name="days" value="1800" min="1" required>
+              </div>
+              <button type="submit" class="btn btn-primary">Compare</button>
+          </form>
+          <div class="text-center mt-4" style="color:#888;font-size:0.95em;">
+              Example: <code>^GSPC,AAPL,MSFT,GOOG</code> &nbsp; | &nbsp; Days: <code>3650</code><br>
+              Following tickers can be put as 1st position for beta calculation.<br>
+              <code>^GSPC=S&P 500, ^IXIC=NASDAQ, ^DJI=Dow Jones, ^TWII=TAIEX</code>
+              
+          </div>
+      </div>
+  </body>
+  </html>
+  '''
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+def get_expirations(ticker):
+  stock = yf.Ticker(ticker)
+  return stock.options
+
+
+
+
+################################################################################################################################################################
+def get_option_chain(ticker, expiration):
+  stock = yf.Ticker(ticker)
+  chain = stock.option_chain(expiration)
+
+  del stock
+  gc.collect()
+
+  return chain.calls, chain.puts
+
+
+
+
+################################################################################################################################################################
+def calculate_max_pain(calls, puts):
+  # Data cleaning and type enforcement
+  calls = calls.copy()
+  puts = puts.copy()
+
+  # Ensure openInterest column exists and handle missing values
+  if 'openInterest' not in calls.columns:
+      calls['openInterest'] = 0
+  if 'openInterest' not in puts.columns:
+      puts['openInterest'] = 0
+
+  calls['openInterest'] = pd.to_numeric(calls['openInterest'], errors='coerce').fillna(0)
+  puts['openInterest'] = pd.to_numeric(puts['openInterest'], errors='coerce').fillna(0)
+
+  all_strikes = sorted(set(calls['strike']).union(set(puts['strike'])))
+  
+  if not all_strikes:
+    return 0
+
+  pain = {}
+
+  for price in all_strikes:
+    # Call Loss: sum(OI * (Price - Strike)) where Strike < Price (ITM Calls)
+    itm_calls = calls[calls['strike'] < price]
+    call_loss = (itm_calls['openInterest'] * (price - itm_calls['strike'])).sum()
+    
+    # Put Loss: sum(OI * (Strike - Price)) where Strike > Price (ITM Puts)
+    itm_puts = puts[puts['strike'] > price]
+    put_loss = (itm_puts['openInterest'] * (itm_puts['strike'] - price)).sum()
+    
+    pain[price] = call_loss + put_loss
+
+  del all_strikes
+  gc.collect()
+
+  if not pain:
+      return 0
+      
+  return min(pain, key=pain.get)
+
+
+
+
+################################################################################################################################################################
+def build_chart_option(calls, puts, ticker, max_pain, underlying_price):
+
+  df_calls = calls[['strike', 'openInterest']].dropna()
+  df_puts = puts[['strike', 'openInterest']].dropna()
+
+  # 計算選擇權賣方的總損失
+  strikes = sorted(set(df_calls['strike']).union(set(df_puts['strike'])))
+  # Normalize to consistent string format to ensure markLine xAxis matching
+  def fmt_strike(s):
+    return str(int(s)) if s == int(s) else str(s)
+  strike_labels = [fmt_strike(s) for s in strikes]
+
+  call_losses = []
+  put_losses = []
+  for expiry_price in strikes:
+    # 看漲選擇權損失：價內 (strike < expiry_price)
+    call_loss = df_calls[df_calls['strike'] < expiry_price].apply(
+        lambda r: (expiry_price - r['strike']) * r['openInterest'], axis=1).sum()
+    # 看跌選擇權損失：價內 (strike > expiry_price)
+    put_loss = df_puts[df_puts['strike'] > expiry_price].apply(
+        lambda r: (r['strike'] - expiry_price) * r['openInterest'], axis=1).sum()
+    call_losses.append(float(call_loss))
+    put_losses.append(float(put_loss))
+
+  """
+  mark_line = {
+      "symbol": ["none", "none"],
+      "label": {"formatter": "{b}: {c}", "position": "insideMiddle"},
+      "lineStyle": {"type": "dashed"},
+      "data": [
+          {"xAxis": str(max_pain), "name": "Max Pain", "lineStyle": {"color": "blue"}},
+          {"xAxis": str(round(underlying_price, 2)), "name": "Underlying", "lineStyle": {"color": "orange"}}
+      ]
+  }
+  """
+  mark_line = {
+    "symbol": ["none", "none"],
+    "label": {"formatter": "{b}: {c}", "position": "insideMiddle"},
+    "lineStyle": {"type": "dashed"},
+    "data": []
+  }
+
+  # 保證轉成字串，且格式與 strike_labels 一致
+  if max_pain is not None:
+    mark_line["data"].append({
+      "xAxis": fmt_strike(max_pain),
+      "name": "Max Pain",
+      "lineStyle": {"color": "blue"}
+    })
+
+  if underlying_price is not None:
+    # 找到離 underlying_price 最近的 strike（讓 x 軸可以對得上）
+    closest_strike = min(strikes, key=lambda x: abs(x - underlying_price))
+    mark_line["data"].append({
+      "xAxis": fmt_strike(closest_strike),
+      "name": "Underlying",
+      "lineStyle": {"color": "orange"}
+    })
+
+  # chart1：選擇權賣方的總損失
+  chart1 = {
+    "tooltip": {"trigger": "axis"},
+    "legend": {"data": ["Call Loss", "Put Loss"]},
+    "xAxis": {
+        "type": "category",
+        "data": strike_labels,
+        "name": "履約價",
+        "axisLabel": {"rotate": 45}
+    },
+    "yAxis": {
+        "type": "value",
+        "name": "Total Loss ($)",
+        "min": "dataMin",
+        "max": "dataMax"
+    },
+    "series": [
+        {"name": "Call Loss", "type": "bar", "data": call_losses, "itemStyle": {"color": "#d62728"}, "markLine": mark_line},
+        {"name": "Put Loss", "type": "bar", "data": put_losses, "itemStyle": {"color": "#2ca02c"}},
+    ]
+  }
+
+  # chart2：未平倉合約數
+  # Use groupby to safely handle duplicate strikes (returns scalar, not Series)
+  call_oi_map = df_calls.groupby('strike')['openInterest'].sum()
+  put_oi_map  = df_puts.groupby('strike')['openInterest'].sum()
+  call_oi = [int(call_oi_map.get(s, 0)) for s in strikes]
+  put_oi  = [-int(put_oi_map.get(s, 0)) for s in strikes]
+
+  chart2 = {
+    "tooltip": {"trigger": "axis"},
+    "legend": {"data": ["Call OI", "Put OI"]},
+    "xAxis": {
+      "type": "category",
+      "data": strike_labels,
+      "name": "履約價",
+      "axisLabel": {"rotate": 45}
+    },
+    "yAxis": {
+      "type": "value",
+      "name": "Open Interest",
+      "min": "dataMin",
+      "max": "dataMax"
+    },
+    "series": [
+      {"name": "Call OI", "type": "bar", "stack": "x", "data": call_oi, "itemStyle": {"color": "#d62728"}, "markLine": mark_line},
+      {"name": "Put OI", "type": "bar", "stack": "x", "data": put_oi, "itemStyle": {"color": "#2ca02c"}},
+    ]
+  }
+
+  del call_losses, put_losses, call_oi, put_oi
+  gc.collect()
+
+  return json.dumps({"chart1": chart1, "chart2": chart2})
+
+
+
+
+################################################################################################################################################################
+@app.route('/maxpain/', methods=['GET', 'POST'])
+def maxpain():
+  ticker = ""
+  expirations = []
+  selected_exp = ""
+  max_pain = None
+  chart = None
+  error = None
+  underlying_price = None
+
+  if request.method == 'POST':
+    action = request.form.get('action')
+    ticker = request.form.get('ticker', '').upper()
+    selected_exp = request.form.get('expiration')
+
+    try:
+      if action == 'get_expirations':
+        expirations = get_expirations(ticker)
+
+      elif action == 'get_chart':
+        expirations = get_expirations(ticker)               
+        if not selected_exp:
+            raise ValueError("請選擇到期日")
+        calls, puts = get_option_chain(ticker, selected_exp)
+        max_pain = calculate_max_pain(calls, puts)
+        
+        hist = yf.Ticker(ticker).history(period="1d")
+        if hist.empty:
+            underlying_price = 0
+        else:
+            underlying_price = hist['Close'][-1]
+          
+        del hist
+        gc.collect()
+      
+        chart = build_chart_option(calls, puts, ticker, max_pain, underlying_price)
+
+    except Exception as e:
+      error = str(e)
+
+  print(f"max_pain_price = {max_pain}, underlying_price = {underlying_price}")
+
+  return render_template(
+    'maxpain.html',
+    ticker=ticker,
+    expirations=expirations,
+    selected_exp=selected_exp,
+    max_pain=max_pain,
+    underlying_price=underlying_price,
+    chart=chart,
+    error=error
+  )
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+@app.route('/tgs/')
+def index():
+  return render_template('tgs.html')
+
+
+
+
+################################################################################################################################################################
+@app.route('/tgs_analyze', methods=['POST'])
+def analyze():
+  data = request.form
+  
+  # 1. 獲取參數
+  user_api_key = data.get('api_key')
+  if user_api_key == "wwsspp":
+    user_api_key = api_key
+  selected_model = data.get('model_name')
+
+  if not user_api_key:
+    return jsonify({'success': False, 'error': '請輸入有效的 Gemini API Key'})
+  
+  # 3. 獲取策略參數
+  company_name = data.get('company_name')
+  context_structure = data.get('context_structure')
+  context_drivers = data.get('context_drivers')
+  context_uncertainty = data.get('context_uncertainty')
+  boundary_conditions = data.get('boundary_conditions')
+
+  # 4. Prompt (邏輯不變，維持 3C 架構)
+  prompt = f"""
+  你現在是精通李吉仁教授《轉型再成長》一書的首席策略顧問。
+  你的任務是為 **「{company_name}」** 這家公司進行深度的策略規劃。
+  請使用你的 Google Search 搜尋能力，先對該公司做深度研究，再依據 **Context (環境脈絡)、Change (策略改變)、Choice (策略選擇)** 的 3C 架構進行分析。
+  
+  *** 深度研究指令 (Deep Research Instructions) ***
+  1.  **廣泛搜尋**：請不要只進行一次搜尋。請利用 Google Search 工具，針對該公司的「財務報表」、「競爭對手動態」、「產業分析報告」與「最新新聞」進行多角度的資料檢索。
+  2.  **數據支撐**：分析時，請務必引用具體的數字（如營收成長率、毛利率變化、市佔率）來支持你的論點。
+  3.  **交叉比對**：請結合搜尋到的外部客觀數據，與使用者提供的內部 Context 進行交叉比對。
+  
+  **使用者輸入 (Context)：**
+  1. 目標公司：{company_name}
+  2. 產業結構與改變脈絡: {context_structure}
+  3. 未來成長驅動因子: {context_drivers}
+  4. 不確定因素與可變性: {context_uncertainty}
+  5. 邊界條件: {boundary_conditions}
+
+  ---
+  **任務執行步驟：**
+
+  ### 第一部分：財務與成長動力掃描 (基於搜尋結果)
+  請搜尋 **{company_name}** 過去五年的財務報表與新聞，簡要分析：
+  * **營收與獲利趨勢：** (近五年是成長、持平還是衰退？)
+  * **主要成長/衰退原因：** (市場因素或競爭因素？)
+  * **現有核心動力：** (目前是靠什麼賺錢？)
+  
+  ### 第二部分：3C 策略架構分析
+  基於上述財務背景與使用者的輸入，進行 Context, Change, Choice 分析：
+  
+  **Module 1: Context 情境洞察**
+  * 根據使用者輸入，辨識成長機會與形成成長機會的結構性脈絡，同時理解未來可能的風險，作為後續成長方向與路徑選擇的依據。
+  
+  **Module 2: Change 變革核心**
+  * 基於**改變以創造未來**的核心概念，建立想要改變的方向：建立事業新願景，提升價值定位，建構新競爭優勢。
+
+  **Module 3: Choice 策略選擇**
+  * 首先根據使用者輸入內容，分析**企業核心能力**
+  * 根據**由內而外**與**由外而內**的兩種策略思維，結合**企業核心能力**，回答以下的關鍵問題 ：產品市場選擇，商業模式選擇，成長模式選擇 (外部併購、內部發展、策略性外包、切割獨立)。
+
+  ### 第三部分：轉型再成長的策略擬定
+  * 最後，根據第一部分的財務與成長動力掃描以及第二部分的3C策略架構分析，用**以終為始**的心智模式，分析企業領導人應該建立的企業願景。 
+  * 接下來，透過願景建立新的期望目標，盤點現狀與期望目標間的差距，發展關鍵路徑，幫此公司擬訂**轉型再成長**的策略。
+  * 策略的規劃需要按照書中的 **SPTSi** 架構：
+    1. **Strategy Choice** 從 Gap Analysis 建立若干策略軸線。
+    2. 在特定策略軸線下，**Key Path** 符合 MECE 原則拆解，確保所有路徑匯聚起來可以造成策略軸線想要改變的結果。
+    3. **Tactical Action** 需對應所列出的 **Key Path**，專注於兩類戰術行動：一種是改變現狀的行動，另外一種是攸關重要資源投入的專案行動。
+    4. **Success Indicator** 需對應所列出的 **Tactical Action**，可以有兩種不同面向的界定：一種是兼容過程與結果指標，另外一種是兼容品質與數量的成功指標。
+  """
+
+  """
+  # 2. 設定 Gemini
+  try:
+    genai.configure(api_key=user_api_key)
+    # 使用使用者選擇的模型
+    model = genai.GenerativeModel(selected_model)
+  except Exception as e:
+    return jsonify({'success': False, 'error': f'模型設定失敗: {str(e)}'})
+
+  try:
+    response = model.generate_content(prompt)
+    analysis_html = markdown.markdown(response.text, extensions=['fenced_code'])
+    #return jsonify({'success': True, 'content': analysis_html, 'raw_markdown': response.text})
+    return jsonify({'success': True, 'content': analysis_html})
+  except Exception as e:
+    return jsonify({'success': False, 'error': str(e)})
+  """
+  
+  url = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent"
+  
+  headers = {
+    "Content-Type": "application/json",
+    "x-goog-api-key": user_api_key
+  }
+
+  # ★★★ 關鍵邏輯：根據模型版本切換工具名稱 ★★★
+  # Gemini 2.0 使用 "google_search"
+  tool_definition = {"google_search": {}}
+  payload = {
+    "contents": [{
+      "parts": [{"text": prompt}]
+    }],
+    "tools": [
+      tool_definition
+    ]
+  }
+
+  try:
+    # 5. 發送請求
+    response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=600)
+    
+    # 6. 錯誤處理
+    if response.status_code != 200:
+      error_msg = f"API Error ({response.status_code}): {response.text}"
+      print(error_msg)
+      return jsonify({'success': False, 'error': error_msg})
+
+    # 7. 解析 JSON 回傳
+    result_json = response.json()
+    
+    # 檢查是否有候選回應
+    if 'candidates' not in result_json or not result_json['candidates']:
+      return jsonify({'success': False, 'error': 'AI 未回傳任何內容 (可能被安全機制阻擋)'})
+      
+    candidate = result_json['candidates'][0]
+    
+    # 提取文字內容
+    if 'content' in candidate and 'parts' in candidate['content']:
+      parts = candidate['content']['parts']
+        
+      # 使用 List Comprehension 提取所有 part 的 text 並串接
+      # part.get('text', '') 確保萬一某個 part 沒有 text 欄位也不會報錯
+      raw_text = "".join([part.get('text', '') for part in parts])
+      
+      # 轉換 Markdown
+      #analysis_html = markdown.markdown(raw_text, extensions=['fenced_code'])
+      #print(analysis_html)
+      
+      return jsonify({
+        'success': True, 
+        'raw_markdown': raw_text
+      })
+    else:
+       return jsonify({'success': False, 'error': '回傳格式異常，找不到 content parts'})
+
+  except Exception as e:
+    print(f"Server Error: {e}")
+    return jsonify({'success': False, 'error': f"伺服器內部錯誤: {str(e)}"})
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
+# ==========================================
+# PART 1: Heatmap Logic
+# ==========================================
+
+TWSE_URL = "https://heatmap.fugle.tw/api/heatmaps/IX0001"
+OTC_URL = "https://heatmap.fugle.tw/api/heatmaps/IX0043"
+
+# S&P 500 相關設定
+SP500_CSV_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+SP500_DATA_URL = "https://www.slickcharts.com/sp500"
+
+# Nasdaq 100 相關設定
+NDX_CSV_URL = "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/top_100.csv"
+NDX_DATA_URL = "https://www.slickcharts.com/nasdaq100"
+
+INDEX_LIST =  ["^TWII", "^TWOII", "00631L.TW", "^GSPC", "^RUT", "^N225", "^KS11", "VOO", "QQQ", "QLD", "000300.SS"]
+
+HEADERS_FUGLE = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+INDUSTRY_MAP = {
+  "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
+  "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙工業",
+  "10": "鋼鐵工業", "11": "橡膠工業", "12": "汽車工業", "14": "建材營造",
+  "15": "航運業", "16": "觀光餐旅", "17": "金融保險", "18": "貿易百貨",
+  "19": "綜合", "20": "其他", "21": "化學工業", "22": "生技醫療業",
+  "23": "油電燃氣業", "24": "半導體業", "25": "電腦及週邊設備業",
+  "26": "光電業", "27": "通信網路業", "28": "電子零組件業",
+  "29": "電子通路業", "30": "資訊服務業", "31": "其他電子業",
+  "32": "文化創意業", "33": "農業科技業", "34": "電子商務",
+  "35": "綠能環保", "36": "數位雲端", "37": "運動休閒",
+  "38": "居家生活", "80": "管理股票",
+}
+
+# GICS Sector 快取 (只讀取一次)
+GICS_SECTOR_CACHE = {}
+
+# Nasdaq 100 ICB Subsector 快取
+NDX_SUBSECTOR_CACHE = {}
+
+PTT_AUTHORS = ["sky22485816", "a000000000", "waitrop", "zmcx16", "Robertshih", "Test520", "zesonpso", "MrChen", "phcebus", "f204137", "a0808996", "IBIZA", "leo15824", "tosay", "LDPC", "nina801105", "mrp", "minazukimaya", "liliumeow", "onekoni"]
+
+DATA_CACHE = {"twse": None, "otc": None, "last_update": 0}
+CACHE_DURATION = 300
+
+
+
+
+def industry_label(code) -> str:
+  if code is None: return "其他"
+  s = str(code).strip().zfill(2)
+  return INDUSTRY_MAP.get(s, "其他")
+
+
+
+'''
+def init_sp500_sectors():
+  """初始化 S&P 500 的 GICS Sector 對應表 (只執行一次)"""
+  global GICS_SECTOR_CACHE
+  
+  if GICS_SECTOR_CACHE:  # 如果已經載入過就直接返回
+    print("[DEBUG] GICS Sector Cache already loaded.")
+    return
+  
+  try:
+    print("[DEBUG] Fetching S&P 500 GICS Sectors from Wikipedia...")
+    
+    # 使用 curl_cffi 的 impersonate 參數
+    r = requests.get(
+      SP500_WIKI_URL, 
+      impersonate="chrome120",
+      timeout=15
+    )
+    
+    print(f"[DEBUG] Wikipedia Response: {r.status_code}")
+    
+    if r.status_code == 200:
+      # 使用 pandas 讀取 HTML 表格
+      df_list = pd.read_html(r.text)
+      
+      if df_list:
+        df = df_list[0]  # 取第一個表格
+        
+        print(f"[DEBUG] Wikipedia Table Columns: {df.columns.tolist()}")
+        
+        # 建立 Symbol -> GICS Sector 的對應
+        for _, row in df.iterrows():
+          try:
+            symbol = str(row.get('Symbol', '')).strip()
+            sector = str(row.get('GICS Sector', 'Unknown')).strip()
+            
+            if symbol and symbol != 'nan':
+              GICS_SECTOR_CACHE[symbol] = sector
+          except Exception as e:
+            continue
+        
+        print(f"[DEBUG] GICS Sectors loaded: {len(GICS_SECTOR_CACHE)} symbols")
+        
+         # 驗證前 5 個
+        print("[DEBUG] First 5 entries:")
+        for i, (k, v) in enumerate(list(GICS_SECTOR_CACHE.items())[:5]):
+          print(f"  {k}: {v}")
+
+      else:
+        print("[WARN] No tables found in Wikipedia page")
+    else:
+      print(f"[WARN] Wikipedia fetch failed: {r.status_code}")
+      
+  except Exception as e:
+    print(f"[ERROR] Failed to load GICS Sectors: {e}")
+    traceback.print_exc()
+'''
+def init_sp500_sectors():
+  """初始化 S&P 500 的 GICS Sector 對應表（從 GitHub CSV 抓取）"""
+  global GICS_SECTOR_CACHE
+
+  if GICS_SECTOR_CACHE:
+    print("[DEBUG] GICS Sector Cache already loaded.")
+    return
+
+  try:
+    print("[DEBUG] Fetching S&P 500 GICS Sectors from GitHub CSV...")
+    r = requests.get(SP500_CSV_URL, timeout=15)
+    print(f"[DEBUG] S&P 500 CSV Response: {r.status_code}")
 
     if r.status_code == 200:
-      '''
-      old_string = '<script type="c900c2a7c1e12d05ff5802d2-text/javascript">\nvar majorchartweek;\n$(document).ready(function() {\n	majorchartweek = new Highcharts.Chart({'
-      new_string = '<script>\n	var chart = Highcharts.chart({'
-      idx_b = r.text.find('<div id="C2" style="width: 715px;"')
-      idx_e = r.text.find('</table>\n</div>', idx_b)
-      week_chart = r.text[idx_b:idx_e+15]
-      week_chart_list = week_chart.split('\n')
-      tmp = '\n'.join(week_chart_list[0:4]) + '<div id="majorchartweek_container"></div>\n<script>\nvar chart = Highcharts.chart({\n' + '\n'.join(week_chart_list[8:])
-      week_chart_modified = tmp.replace('display:none;', '').replace('715px', '1024px').replace('height: 285, width: 760', 'height: 400, width: 1000').replace('	});', '').replace('id="C2" style="width:1024px; position:;"', 'align="center"', 1)
-      
-      idx_b = r.text.find('<div id="D2"')
-      idx_e = r.text.find('</div>', idx_b)
-      diff_table = r.text[idx_b:idx_e+6].replace(' display:none', '').replace('715px', '1024px').replace('id="D2" style="width:1024px;"', 'align="center"', 1)
+      from io import StringIO as _SIO
+      df = pd.read_csv(_SIO(r.text))
+      for _, row in df.iterrows():
+        symbol = str(row.get('Symbol', '')).strip()
+        sector = str(row.get('GICS Sector', 'Unknown')).strip()
+        if symbol and symbol != 'nan':
+          GICS_SECTOR_CACHE[symbol] = sector
 
-      html = '\n'.join(['\n', week_chart_modified, '<br>', diff_table, '\n'])
-      '''
-      r.encoding = 'utf-8'
-      
-      # Weekly chart
-      idx_b = r.text.find('var majorchartweek;')
-      if idx_b == -1:
-        chart_html = ''
-      else:
-        idx_e = r.text.find('</script>', idx_b)
-        week_chart = r.text[idx_b:idx_e+9]
-        week_chart_modified = week_chart.replace('$(document).ready(function() {', '').replace('height: 285, width: 760', 'height: 400, width: 1000').replace('	});', '')
-        chart_html = '<br>\n<div id="majorchartweek_container" align="center">\n<script type="text/javascript">' + week_chart_modified + '\n</div>\n<br>\n'
-      
-      # Comparison table
-      idx_b = r.text.find("<div id ='D2'")
-      if idx_b == -1:
-        table_html = ''
-      else:
-        idx_e = r.text.find('</div>', idx_b)
-        table_html = r.text[idx_b:idx_e+6].replace('style="width:715px; display:none"', 'align="center"').replace('715px', '1024px')
-      
-      html = chart_html + table_html + '\n<br>\n'
-      
-    print_time_delta(time(), "[PYRAMID]")
+      print(f"[DEBUG] GICS Sectors loaded: {len(GICS_SECTOR_CACHE)} symbols")
+      print("[DEBUG] First 5 entries:")
+      for k, v in list(GICS_SECTOR_CACHE.items())[:5]:
+        print(f"  {k}: {v}")
+    else:
+      print(f"[WARN] S&P 500 CSV fetch failed: {r.status_code}")
+
+  except Exception as e:
+    print(f"[ERROR] Failed to load GICS Sectors: {e}")
+    traceback.print_exc()
+
+
+
+
+def industry_label_us(symbol: str) -> str:
+  """根據 Symbol 查詢對應的 GICS Sector (含容錯處理)"""
   
-  return html
-
-
-
-
-def report_get_goodinfo_chart(token):
-
-  if token.find('.TW') > 0:
-    symbol = token[0:token.index('.TW')]
-    chart = f'  <hr color="#ff8000" align="center">\n\
-  <div align="center"><table><tbody><tr>\n\
-  <td><iframe src="{cm_url}?action=v&id={symbol}" width="600" height="300" frameborder="0" scrolling="no"></iframe></td>\n\
-  <td><iframe src="{cm_url}?action=f&id={symbol}" width="600" height="300" frameborder="0" scrolling="no"></iframe></td>\n\
-  <td><iframe src="{cm_url}?action=e&id={symbol}" width="600" height="300" frameborder="0" scrolling="no"></iframe></td>\n\
-  </tr><tr>\n\
-  <td><iframe src="{cm_url}?action=p&id={symbol}" width="600" height="300" frameborder="0" scrolling="no"></iframe></td>\n\
-  <td><a href="https://goodinfo.tw/tw/StockCashFlow.asp?RPT_CAT=M_YEAR&STOCK_ID={symbol}" target="_blank" style="display:block;width:600px;height:300px;line-height:300px;text-align:center;font-size:18px;text-decoration:none;color:#333;background:#f5f5f5;border:1px solid #ddd;">💰 現金流量 (GoodInfo)</a></td>\n\
-  <td><a href="https://goodinfo.tw/tw/DayTrading.asp?STOCK_ID={symbol}" target="_blank" style="display:block;width:600px;height:300px;line-height:300px;text-align:center;font-size:18px;text-decoration:none;color:#333;background:#f5f5f5;border:1px solid #ddd;">📈 現股當沖 (GoodInfo)</a></td>\n\
-  </tr></tbody></table></div>\n'
-
-    return chart
+  # 1. 直接查找
+  if symbol in GICS_SECTOR_CACHE:
+    return GICS_SECTOR_CACHE[symbol]
   
-  elif token.find('^TWII') == 0:
-    chart = f'  <hr color="#ff8000" align="center">\n\
-  <div align="center"><table><tbody><tr>\n\
-  <td><a href="https://goodinfo.tw/tw/ShowBuySaleChart.asp?STOCK_ID=%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8&CHT_CAT=DATE" target="_blank"><img src="https://goodinfo.tw/tw/image/StockBuySale/BUY_SALE_DATE_%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8.gif"></a></td>\n\
-  <td><a href="https://goodinfo.tw/tw/ShowMarginChart.asp?STOCK_ID=%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8&CHT_CAT=DATE" target="_blank"><img src="https://goodinfo.tw/tw/image/StockMargin/MARGIN_DATE_%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8.gif"></a></td>\n\
-  <td><a href="https://goodinfo.tw/tw/DayTrading.asp?STOCK_ID=%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8" target="_blank"><img src="https://goodinfo.tw/tw/image/StockDayTrading/DAY_TRADING_DATE_%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8.gif"></a></td>\n\
-  </tr></tbody></table></div>\n'
-
-    return chart
-
-  elif token.find('^TWOII') == 0:
-    chart = f'  <hr color="#ff8000" align="center">\n\
-  <div align="center"><table><tbody><tr>\n\
-  <td><a href="https://goodinfo.tw/tw/ShowBuySaleChart.asp?STOCK_ID=%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8&CHT_CAT=DATE" target="_blank"><img src="https://goodinfo.tw/tw/image/StockBuySale/BUY_SALE_DATE_%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8.gif"></a></td>\n\
-  <td><a href="https://goodinfo.tw/tw/ShowMarginChart.asp?STOCK_ID=%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8&CHT_CAT=DATE" target="_blank"><img src="https://goodinfo.tw/tw/image/StockMargin/MARGIN_DATE_%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8.gif"></a></td>\n\
-  <td><a href="https://goodinfo.tw/tw/DayTrading.asp?STOCK_ID=%E5%8A%A0%E6%AC%8A%E6%8C%87%E6%95%B8" target="_blank"><img src="https://goodinfo.tw/tw/image/StockDayTrading/DAY_TRADING_DATE_%E6%AB%83%E8%B2%B7%E6%8C%87%E6%95%B8.gif"></a></td>\n\
-  </tr></tbody></table></div>\n'
-
-    return chart
-    
-  else:
-    return ''
+  # 2. 嘗試將點號轉為破折號 (例如 BRK.B -> BRK-B)
+  symbol_alt1 = symbol.replace('.', '-')
+  if symbol_alt1 in GICS_SECTOR_CACHE:
+    return GICS_SECTOR_CACHE[symbol_alt1]
+  
+  # 3. 嘗試將破折號轉為點號 (例如 BRK-B -> BRK.B)
+  symbol_alt2 = symbol.replace('-', '.')
+  if symbol_alt2 in GICS_SECTOR_CACHE:
+    return GICS_SECTOR_CACHE[symbol_alt2]
+  
+  # 4. 嘗試移除所有符號 (例如 BRK.B -> BRKB)
+  symbol_alt3 = symbol.replace('.', '').replace('-', '')
+  if symbol_alt3 in GICS_SECTOR_CACHE:
+    return GICS_SECTOR_CACHE[symbol_alt3]
+  
+  # 5. 找不到時打印警告
+  print(f"[WARN] GICS Sector not found for symbol: {symbol} (tried: {symbol}, {symbol_alt1}, {symbol_alt2}, {symbol_alt3})")
+  return "Unknown"
+  
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Flask application
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Flask app ───────────────────────────────────────────────────────────────
-app = Flask(__name__)
+def init_ndx_subsectors():
+  """初始化 Nasdaq 100 的 Subsector 對應表（從 GitHub CSV 抓取）"""
+  global NDX_SUBSECTOR_CACHE
 
-WORK_DIR = os.path.join(tempfile.gettempdir(), 'yfinance_flask')
-os.makedirs(WORK_DIR, exist_ok=True)
+  if NDX_SUBSECTOR_CACHE:
+    print("[DEBUG] Nasdaq 100 Subsector Cache already loaded.")
+    return
+
+  try:
+    print("[DEBUG] Fetching Nasdaq 100 Subsectors from GitHub CSV...")
+    r = requests.get(NDX_CSV_URL, timeout=15)
+    print(f"[DEBUG] NDX CSV Response: {r.status_code}")
+
+    if r.status_code == 200:
+      from io import StringIO as _SIO
+      df = pd.read_csv(_SIO(r.text))
+      for _, row in df.iterrows():
+        ticker = str(row.get('symbol', '')).strip()
+        subsector = str(row.get('industry', 'Unknown')).strip()
+        if ticker and ticker != 'nan':
+          NDX_SUBSECTOR_CACHE[ticker] = subsector
+
+      print(f"[DEBUG] Nasdaq 100 Subsectors loaded: {len(NDX_SUBSECTOR_CACHE)} symbols")
+      print("[DEBUG] First 5 entries:")
+      for k, v in list(NDX_SUBSECTOR_CACHE.items())[:5]:
+        print(f"  {k}: {v}")
+    else:
+      print(f"[WARN] NDX CSV fetch failed: {r.status_code}")
+
+  except Exception as e:
+    print(f"[ERROR] Failed to load Nasdaq 100 Subsectors: {e}")
+    traceback.print_exc()
 
 
-# ── Static: serve generated chart HTML files ────────────────────────────────
-@app.route('/charts/<path:filename>')
-def serve_chart(filename):
-    filepath = os.path.join(WORK_DIR, filename)
-    if not os.path.exists(filepath):
-        return 'Chart file not found', 404
-    return send_file(filepath)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Form page
-# ═══════════════════════════════════════════════════════════════════════════
+def industry_label_ndx(symbol: str) -> str:
+  """根據 Symbol 查詢對應的 ICB Subsector (含容錯處理)"""
+  
+  # 1. 直接查找
+  if symbol in NDX_SUBSECTOR_CACHE:
+    return NDX_SUBSECTOR_CACHE[symbol]
+  
+  # 2. 嘗試將點號轉為破折號 (例如 BRK.B -> BRK-B)
+  symbol_alt1 = symbol.replace('.', '-')
+  if symbol_alt1 in NDX_SUBSECTOR_CACHE:
+    return NDX_SUBSECTOR_CACHE[symbol_alt1]
+  
+  # 3. 嘗試將破折號轉為點號 (例如 BRK-B -> BRK.B)
+  symbol_alt2 = symbol.replace('-', '.')
+  if symbol_alt2 in NDX_SUBSECTOR_CACHE:
+    return NDX_SUBSECTOR_CACHE[symbol_alt2]
+  
+  # 4. 嘗試移除所有符號 (例如 BRK.B -> BRKB)
+  symbol_alt3 = symbol.replace('.', '').replace('-', '')
+  if symbol_alt3 in NDX_SUBSECTOR_CACHE:
+    return NDX_SUBSECTOR_CACHE[symbol_alt3]
+  
+  # 5. 找不到時打印警告
+  print(f"[WARN] ICB Subsector not found for symbol: {symbol} (tried: {symbol}, {symbol_alt1}, {symbol_alt2}, {symbol_alt3})")
+  return "Unknown"
 
-_FORM_PAGE = '''\
-<!DOCTYPE html>
-<html lang="zh-TW">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Stock Analyzer</title>
-  <style>
-    :root {
-      --accent: #ff8000;
-      --bg:     #1a1a2e;
-      --card:   #16213e;
-      --input:  #0f3460;
-      --text:   #e0e0e0;
-      --muted:  #888;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: Arial, Helvetica, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-    }
-    .card {
-      background: var(--card);
-      border-radius: 12px;
-      padding: 2.2rem 2.5rem;
-      width: 100%;
-      max-width: 460px;
-      box-shadow: 0 8px 32px rgba(0,0,0,.45);
-    }
-    h1 { color: var(--accent); font-size: 1.4rem; margin-bottom: 1.5rem; text-align: center; }
-    label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: .25rem; }
-    input[type="text"], input[type="number"], input[type="password"] {
-      width: 100%;
-      background: var(--input);
-      border: 1px solid #3a4a6a;
-      border-radius: 6px;
-      color: #fff;
-      padding: .55rem .8rem;
-      font-size: .9rem;
-      margin-bottom: 1rem;
-      transition: border-color .2s;
-    }
-    input:focus { outline: none; border-color: var(--accent); }
-    button[type="submit"] {
-      width: 100%;
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      border-radius: 6px;
-      padding: .7rem;
-      font-size: 1rem;
-      cursor: pointer;
-      transition: opacity .2s;
-    }
-    button:hover { opacity: .85; }
-    .hint { font-size: .72rem; color: var(--muted); margin-top: .6rem; text-align: center; }
-    .loading-overlay {
-      display: none;
-      text-align: center;
-      padding: 2rem 0;
-    }
-    .spinner {
-      width: 40px; height: 40px;
-      border: 4px solid #334;
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin .8s linear infinite;
-      margin: 0 auto 1rem;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Stock Analyzer</h1>
-    <div id="form-area">
-      <form method="POST" action="/analyze" onsubmit="showLoading()">
-        <label>Ticker &mdash; 美股如 AAPL，台股如 2330.</label>
-        <input type="text" name="ticker" placeholder="AAPL" required autofocus>
 
-        <label>顯示天數 (Days)</label>
-        <input type="number" name="days" value="365" min="30" max="1825">
 
-        <label>FinLab Token（台股選填，留空改用 histock 爬蟲）</label>
-        <input type="password" name="finlab_token" placeholder="（選填）">
 
-        <button type="submit">開始分析</button>
-        <p class="hint">分析含網路爬蟲，通常需要 30–90 秒，請耐心等候</p>
-      </form>
-    </div>
-    <div class="loading-overlay" id="loading-area">
-      <div class="spinner"></div>
-      <p style="color:var(--accent)">資料抓取中，請稍候&hellip;</p>
-      <p style="font-size:.75rem;color:var(--muted);margin-top:.5rem">
-        正在下載歷史K線、法人籌碼與財報資料
-      </p>
-    </div>
-  </div>
-  <script>
-    function showLoading() {
-      document.getElementById('form-area').style.display = 'none';
-      document.getElementById('loading-area').style.display = 'block';
-    }
-  </script>
-</body>
-</html>
+'''
+def fetch_heatmap_data():
+  now = time.time()
+  if (DATA_CACHE["twse"] is None) or (now - DATA_CACHE["last_update"] > CACHE_DURATION):
+    try:
+      print(f"[{time.ctime()}] [DEBUG] Starting Heatmap Update...")
+
+      # === 台股資料 (原有邏輯) ===
+      r_twse = requests.get(TWSE_URL, headers=HEADERS_FUGLE, timeout=15)
+      r_otc = requests.get(OTC_URL, headers=HEADERS_FUGLE, timeout=15)
+
+      print(f"[DEBUG] Fugle Response - TWSE: {r_twse.status_code}, OTC: {r_otc.status_code}")
+
+      if r_twse.status_code == 200:
+        data_twse = r_twse.json().get("data", [])
+        DATA_CACHE["twse"] = pd.DataFrame(data_twse)
+        print(f"[DEBUG] TWSE Data loaded: {len(data_twse)} rows")
+
+      if r_otc.status_code == 200:
+        data_otc = r_otc.json().get("data", [])
+        DATA_CACHE["otc"] = pd.DataFrame(data_otc)
+        print(f"[DEBUG] OTC Data loaded: {len(data_otc)} rows")
+
+      # === [新增] S&P 500 資料 ===
+      print("[DEBUG] Fetching S&P 500 data from SlickCharts...")
+      try:
+        # 使用 curl_cffi 的 impersonate 參數
+        r_sp500 = requests.get(
+          SP500_DATA_URL,
+          impersonate="chrome120",
+          timeout=15
+        )
+
+        print(f"[DEBUG] SlickCharts Response: {r_sp500.status_code}")
+
+        if r_sp500.status_code == 200:
+          soup = BS(r_sp500.text, 'html.parser')
+
+          # 找到 <div class="col-lg-7"> 內的表格
+          target_div = soup.find('div', class_='col-lg-7')
+
+          if target_div:
+            table = target_div.find('table')
+
+            if table:
+              # 解析表格
+              rows = []
+              tbody = table.find('tbody')
+
+              if tbody:
+                for idx, tr in enumerate(tbody.find_all('tr')):
+                  cols = tr.find_all('td')
+
+                  if len(cols) >= 7:
+                    try:
+                      # SlickCharts 表格結構:
+                      # 0: #(Rank), 1: Company, 2: Symbol, 3: Weight,
+                      # 4: Price, 5: Chg, 6: % Chg
+
+                      company = cols[1].text.strip()
+                      symbol = cols[2].text.strip()
+                      weight_raw = cols[3].text.strip()
+                      price_raw = cols[4].text.strip()
+                      change_raw = cols[5].text.strip()
+                      pct_change_raw = cols[6].text.strip()
+
+                      # === [關鍵修正] 正負號判斷邏輯 ===
+
+                      # Weight 處理
+                      weight_str = weight_raw.replace('%', '').strip()
+                      weight = float(weight_str)
+
+                      # Price 處理
+                      price_str = price_raw.replace('$', '').replace(',', '').strip()
+                      price = float(price_str)
+
+                      # Change 處理：保留原始正負號
+                      change_str = change_raw.replace('$', '').replace(',', '').strip()
+                      change = float(change_str)  # 直接轉換，保留 +/- 號
+
+                      # % Change 處理：移除括號和百分比符號，但保留原始正負號
+                      # 從 Chg 欄位判斷正負（因為 % Chg 的括號不代表負數）
+                      pct_change_str = pct_change_raw.replace('(', '').replace(')', '').replace('%', '').strip()
+                      pct_change = float(pct_change_str)
+
+                      # [重要] 根據 Chg 的正負來決定 % Chg 的正負
+                      if change < 0:
+                        pct_change = -abs(pct_change)
+                      else:
+                        pct_change = abs(pct_change)
+
+                      # 取得 GICS Sector
+                      sector = industry_label_us(symbol)
+
+                      rows.append({
+                        "symbol": symbol,
+                        "name": company,
+                        "closePrice": price,
+                        "change": change,
+                        "changePercent": pct_change,
+                        "weight": weight,
+                        "industry": sector,
+                        "type": "EQUITY"
+                      })
+
+                      # 調試：打印前 3 筆
+                      if idx < 3:
+                        print(f"[DEBUG] {symbol}: Change={change}, %Chg={pct_change}, Weight={weight}")
+
+                    except (ValueError, IndexError, AttributeError) as e:
+                      print(f"[WARN] Parsing row {idx} error: {e}")
+                      print(f"[WARN] Raw cols: {[c.text.strip() for c in cols[:7]]}")
+                      continue
+
+              if rows:
+                DATA_CACHE["sp500"] = pd.DataFrame(rows)
+                print(f"[DEBUG] S&P 500 Data loaded: {len(rows)} rows")
+              else:
+                print("[WARN] No valid rows parsed from SlickCharts table")
+            else:
+              print("[WARN] Table not found in target div")
+          else:
+            print("[WARN] <div class='col-lg-7'> not found")
+        else:
+          print(f"[WARN] SlickCharts fetch failed: {r_sp500.status_code}")
+
+      except Exception as e:
+        print(f"[ERROR] SlickCharts fetch error: {e}")
+        traceback.print_exc()
+
+      # === Nasdaq 100 資料 ===
+      print("[DEBUG] Fetching Nasdaq 100 data from SlickCharts...")
+      try:
+        r_ndx = requests.get(NDX_DATA_URL, impersonate="chrome120", timeout=15)
+
+        print(f"[DEBUG] SlickCharts Nasdaq 100 Response: {r_ndx.status_code}")
+
+        if r_ndx.status_code == 200:
+          soup = BS(r_ndx.text, 'html.parser')
+          target_div = soup.find('div', class_='col-lg-7')
+
+          if target_div:
+            table = target_div.find('table')
+
+            if table:
+              rows = []
+              tbody = table.find('tbody')
+
+              if tbody:
+                for idx, tr in enumerate(tbody.find_all('tr')):
+                  cols = tr.find_all('td')
+
+                  if len(cols) >= 7:
+                    try:
+                      # SlickCharts Nasdaq 100 表格結構與 S&P 500 相同
+                      company = cols[1].text.strip()
+                      symbol = cols[2].text.strip()
+                      weight_raw = cols[3].text.strip()
+                      price_raw = cols[4].text.strip()
+                      change_raw = cols[5].text.strip()
+                      pct_change_raw = cols[6].text.strip()
+
+                      weight_str = weight_raw.replace('%', '').strip()
+                      weight = float(weight_str)
+
+                      price_str = price_raw.replace('$', '').replace(',', '').strip()
+                      price = float(price_str)
+
+                      change_str = change_raw.replace('$', '').replace(',', '').strip()
+                      change = float(change_str)
+
+                      pct_change_str = pct_change_raw.replace('(', '').replace(')', '').replace('%', '').strip()
+                      pct_change = float(pct_change_str)
+
+                      if change < 0:
+                        pct_change = -abs(pct_change)
+                      else:
+                        pct_change = abs(pct_change)
+
+                      # 使用 Nasdaq 100 專用的分類函數
+                      subsector = industry_label_ndx(symbol)
+
+                      rows.append({
+                        "symbol": symbol,
+                        "name": company,
+                        "closePrice": price,
+                        "change": change,
+                        "changePercent": pct_change,
+                        "weight": weight,
+                        "industry": subsector,
+                        "type": "EQUITY"
+                      })
+
+                      if idx < 3:
+                        print(f"[DEBUG] NDX {symbol}: Change={change}, %Chg={pct_change}, Weight={weight}, Subsector={subsector}")
+
+                    except (ValueError, IndexError, AttributeError) as e:
+                      print(f"[WARN] Nasdaq 100 Parsing row {idx} error: {e}")
+                      continue
+
+              if rows:
+                DATA_CACHE["ndx"] = pd.DataFrame(rows)
+                print(f"[DEBUG] Nasdaq 100 Data loaded: {len(rows)} rows")
+              else:
+                print("[WARN] No valid rows parsed from Nasdaq 100 table")
+            else:
+              print("[WARN] Nasdaq 100 table not found")
+          else:
+            print("[WARN] Nasdaq 100 <div class='col-lg-7'> not found")
+        else:
+          print(f"[WARN] SlickCharts Nasdaq 100 fetch failed: {r_ndx.status_code}")
+
+      except Exception as e:
+        print(f"[ERROR] SlickCharts Nasdaq 100 fetch error: {e}")
+        traceback.print_exc()
+
+
+      DATA_CACHE["last_update"] = now
+      print(f"[{time.ctime()}] [DEBUG] Heatmap Cache Updated.")
+      
+    except Exception as e:
+      print(f"[ERROR] Fetching heatmap data failed: {e}")
+      traceback.print_exc()
 '''
 
 
-@app.route('/')
-def index():
-    return _FORM_PAGE
+def fetch_us_yahoo_quotes(symbols):
+  """Batch fetch quotes from Yahoo Finance API. Uses session + crumb for auth."""
+  if not symbols:
+    return {}
+  result = {}
+  try:
+    session = requests.Session(impersonate="chrome120")
+    # Step 1: visit a Yahoo Finance stock page to get proper session cookies
+    # (visiting just the homepage doesn't set the right auth cookies)
+    session.get("https://finance.yahoo.com/quote/AAPL/", timeout=10)
+    # Step 2: get crumb token
+    crumb_r = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=10)
+    crumb = crumb_r.text.strip()
+    if not crumb or "<" in crumb or "Too Many" in crumb:
+      print(f"[WARN] Yahoo Finance crumb fetch failed: {crumb_r.status_code} {crumb[:80]}")
+      return {}
+    print(f"[DEBUG] Yahoo Finance crumb: {crumb}")
+  except Exception as e:
+    print(f"[ERROR] fetch_us_yahoo_quotes session/crumb error: {e}")
+    return {}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Analyze route — synchronous; browser waits while we compute
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    ticker       = request.form.get('ticker', '').strip().upper()
-    finlab_token = request.form.get('finlab_token', '').strip()
+  BATCH = 200
+  for i in range(0, len(symbols), BATCH):
+    batch = symbols[i:i+BATCH]
     try:
-        days = int(request.form.get('days', '365'))
-    except ValueError:
-        days = 365
+      url = "https://query2.finance.yahoo.com/v7/finance/quote"
+      params = {
+        "symbols": ",".join(batch),
+        "fields": "regularMarketPrice,regularMarketChangePercent,regularMarketChange,marketCap,shortName,regularMarketVolume,regularMarketOpen,regularMarketDayHigh,regularMarketDayLow",
+        "crumb": crumb,
+      }
+      r = session.get(url, params=params, timeout=15)
+      if r.status_code == 200:
+        data = r.json()
+        for quote in data.get("quoteResponse", {}).get("result", []):
+          sym = quote.get("symbol")
+          if sym:
+            result[sym] = quote
+      else:
+        print(f"[WARN] Yahoo Finance quote batch {i//BATCH+1} failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+      print(f"[ERROR] fetch_us_yahoo_quotes batch {i//BATCH+1} error: {e}")
+  print(f"[DEBUG] fetch_us_yahoo_quotes: got {len(result)} quotes for {len(symbols)} symbols")
+  return result
 
-    if not ticker:
-        return redirect('/')
 
-    # Resolve short TW form: '2454.' → '2454.TW' or '2454.TWO'
-    ticker = stock_is_tw_otc(ticker).upper()
-
-    # 1. Generate pyecharts chart  ─────────────────────────────────────────
-    chart_url = ''
-    chart_err = ''
+def fetch_heatmap_data():
+  now = time.time()
+  if (DATA_CACHE["twse"] is None) or (now - DATA_CACHE["last_update"] > CACHE_DURATION):
     try:
-        path = stock_one_chart(ticker, dir=WORK_DIR, display_days=days, finlab_token=finlab_token)
-        if path:
-            chart_url = '/charts/' + os.path.basename(path)
-    except Exception as exc:
-        chart_err = _html.escape(str(exc))
+      print(f"[{time.ctime()}] [DEBUG] Starting Heatmap Update...")
 
-    # 2. Build portfolio report HTML  ──────────────────────────────────────
-    report_body = _build_report(ticker)
+      # === 台股資料 (原有邏輯，不變) ===
+      r_twse = requests.get(TWSE_URL, headers=HEADERS_FUGLE, timeout=15)
+      r_otc = requests.get(OTC_URL, headers=HEADERS_FUGLE, timeout=15)
 
-    return _render_result(ticker, days, chart_url, chart_err, report_body)
+      print(f"[DEBUG] Fugle Response - TWSE: {r_twse.status_code}, OTC: {r_otc.status_code}")
+
+      if r_twse.status_code == 200:
+        data_twse = r_twse.json().get("data", [])
+        DATA_CACHE["twse"] = pd.DataFrame(data_twse)
+        print(f"[DEBUG] TWSE Data loaded: {len(data_twse)} rows")
+
+      if r_otc.status_code == 200:
+        data_otc = r_otc.json().get("data", [])
+        DATA_CACHE["otc"] = pd.DataFrame(data_otc)
+        print(f"[DEBUG] OTC Data loaded: {len(data_otc)} rows")
+
+      # === S&P 500 資料 (via Yahoo Finance quote API) ===
+      print("[DEBUG] Fetching S&P 500 data from Yahoo Finance...")
+      try:
+        if not GICS_SECTOR_CACHE:
+          init_sp500_sectors()
+        sp500_symbols = list(GICS_SECTOR_CACHE.keys())
+        if sp500_symbols:
+          quotes = fetch_us_yahoo_quotes(sp500_symbols)
+          total_mc = sum((q.get("marketCap") or 0) for q in quotes.values())
+          total_tv = sum(((q.get("regularMarketVolume") or 0) * (q.get("regularMarketPrice") or 0)) for q in quotes.values())
+          rows = []
+          for sym in sp500_symbols:
+            q = quotes.get(sym)
+            if not q:
+              continue
+            mc = q.get("marketCap") or 0
+            price = q.get("regularMarketPrice") or 0
+            vol = q.get("regularMarketVolume") or 0
+            tv = price * vol
+            rows.append({
+              "symbol": sym,
+              "name": q.get("shortName", sym),
+              "closePrice": price,
+              "openPrice": q.get("regularMarketOpen") or price,
+              "highPrice": q.get("regularMarketDayHigh") or price,
+              "lowPrice": q.get("regularMarketDayLow") or price,
+              "tradeVolume": vol,
+              "tradeValue": tv,
+              "change": q.get("regularMarketChange") or 0,
+              "changePercent": q.get("regularMarketChangePercent") or 0,
+              "marketCapWeight": (mc / total_mc * 100) if total_mc > 0 else 0,
+              "tradeValueWeight": (tv / total_tv * 100) if total_tv > 0 else 0,
+              "industry": industry_label_us(sym),
+              "type": "EQUITY"
+            })
+          if rows:
+            DATA_CACHE["sp500"] = pd.DataFrame(rows)
+            print(f"[DEBUG] S&P 500 Data loaded: {len(rows)} rows")
+          else:
+            print("[WARN] No S&P 500 data returned from Yahoo Finance")
+        else:
+          print("[WARN] GICS_SECTOR_CACHE empty, skipping S&P 500")
+      except Exception as e:
+        print(f"[ERROR] S&P 500 Yahoo Finance fetch error: {e}")
+        traceback.print_exc()
+
+      # === Nasdaq 100 資料 (via Yahoo Finance quote API) ===
+      print("[DEBUG] Fetching Nasdaq 100 data from Yahoo Finance...")
+      try:
+        if not NDX_SUBSECTOR_CACHE:
+          init_ndx_subsectors()
+        ndx_symbols = list(NDX_SUBSECTOR_CACHE.keys())
+        if ndx_symbols:
+          quotes = fetch_us_yahoo_quotes(ndx_symbols)
+          total_mc = sum((q.get("marketCap") or 0) for q in quotes.values())
+          total_tv = sum(((q.get("regularMarketVolume") or 0) * (q.get("regularMarketPrice") or 0)) for q in quotes.values())
+          rows = []
+          for sym in ndx_symbols:
+            q = quotes.get(sym)
+            if not q:
+              continue
+            mc = q.get("marketCap") or 0
+            price = q.get("regularMarketPrice") or 0
+            vol = q.get("regularMarketVolume") or 0
+            tv = price * vol
+            rows.append({
+              "symbol": sym,
+              "name": q.get("shortName", sym),
+              "closePrice": price,
+              "openPrice": q.get("regularMarketOpen") or price,
+              "highPrice": q.get("regularMarketDayHigh") or price,
+              "lowPrice": q.get("regularMarketDayLow") or price,
+              "tradeVolume": vol,
+              "tradeValue": tv,
+              "change": q.get("regularMarketChange") or 0,
+              "changePercent": q.get("regularMarketChangePercent") or 0,
+              "marketCapWeight": (mc / total_mc * 100) if total_mc > 0 else 0,
+              "tradeValueWeight": (tv / total_tv * 100) if total_tv > 0 else 0,
+              "industry": industry_label_ndx(sym),
+              "type": "EQUITY"
+            })
+          if rows:
+            DATA_CACHE["ndx"] = pd.DataFrame(rows)
+            print(f"[DEBUG] Nasdaq 100 Data loaded: {len(rows)} rows")
+          else:
+            print("[WARN] No NDX data returned from Yahoo Finance")
+        else:
+          print("[WARN] NDX_SUBSECTOR_CACHE empty, skipping Nasdaq 100")
+      except Exception as e:
+        print(f"[ERROR] NDX Yahoo Finance fetch error: {e}")
+        traceback.print_exc()
+
+      DATA_CACHE["last_update"] = now
+      print(f"[{time.ctime()}] [DEBUG] Heatmap Cache Updated.")
+
+    except Exception as e:
+      print(f"[ERROR] Fetching heatmap data failed: {e}")
+      traceback.print_exc()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Report builder — calls report.py helper functions
-# ═══════════════════════════════════════════════════════════════════════════
+def get_clean_dataframe(market):
+  fetch_heatmap_data()
+  
+  if market == "sp500":
+    df = DATA_CACHE.get("sp500")
+  elif market == "ndx":
+    df = DATA_CACHE.get("ndx")
+  elif market == "twse":
+    df = DATA_CACHE.get("twse")
+  else:
+    df = DATA_CACHE.get("otc")
+  
+  if df is None or df.empty:
+    print(f"[WARN] Dataframe for {market} is empty or None.")
+    return pd.DataFrame()
 
-def _build_report(ticker: str) -> str:
-    """
-    Assembles the report-tab HTML by calling the individual report_get_*
-    helpers from report.py (FinViz, FBS, GoodInfo, Pyramid).
-    Returns a self-contained HTML fragment (no <html>/<body> wrapper).
-    """
+  return df.copy()
 
-    is_tw = '.TW' in ticker
 
-    # ── external links bar ────────────────────────────────────────────────
-    tidx = next((i for i, c in enumerate(ticker) if c == '.'), len(ticker))
-    sym  = ticker[:tidx]
 
-    if is_tw:
-        pe_href  = f'https://www.wantgoo.com/stock/{sym}/enterprise-value/price-to-earning-ratio'
-        pb_href  = f'https://www.wantgoo.com/stock/{sym}/enterprise-value/price-book-ratio'
-        ps_href  = ''
-        fi_href  = f'https://www.wsj.com/market-data/quotes/TW/{sym}/financials/quarter/cash-flow'
-        own_href = ''
-        gex_href = ''
-        ptt_href = f'https://www.ptt.cc/bbs/Stock/search?q={sym}'
-        cm_href  = f'https://www.cmoney.tw/follow/channel/stock-{sym}?chart=d&type=Personal'
-    else:
-        pe_href  = f'https://www.macrotrends.net/assets/php/fundamental_iframe.php?t={ticker}&type=pe-ratio&statement=price-ratios&freq=Q'
-        pb_href  = f'https://www.macrotrends.net/assets/php/fundamental_iframe.php?t={ticker}&type=price-book&statement=price-ratios&freq=Q'
-        ps_href  = f'https://www.macrotrends.net/assets/php/fundamental_iframe.php?t={ticker}&type=price-sales&statement=price-ratios&freq=Q'
-        fi_href  = f'https://www.wsj.com/market-data/quotes/{ticker}/financials/quarter/cash-flow'
-        own_href = f'https://www.dataroma.com/m/stock.php?sym={ticker.replace("-",".")}'
-        gex_href = f'https://unusualwhales.com/stock/{ticker}/greek-exposure'
-        ptt_href = f'https://www.ptt.cc/bbs/Stock/search?q={ticker}'
-        cm_href  = ''
 
-    def alink(href, text):
-        return f'<a href="{_html.escape(href)}" target="_blank">{text}</a>' if href else ''
+def build_heatmap_data(df: pd.DataFrame, type_filter: str, area_metric: str):
+  if df.empty: 
+    return []
 
-    links_html = ' &emsp; '.join(filter(None, [
-        alink(pe_href,  'PE Chart'),
-        alink(pb_href,  'PB Chart'),
-        alink(ps_href,  'PS Chart'),
-        alink(fi_href,  'Finance'),
-        alink(own_href, 'Ownership'),
-        alink(gex_href, 'GEX'),
-        alink(ptt_href, 'PTT'),
-        alink(cm_href,  'CMoney'),
-    ]))
+  data = df[df["type"] == type_filter].copy()
+  
+  if data.empty: 
+    print(f"[DEBUG] No data found for type_filter: {type_filter}")
+    return []
 
-    parts = [
-        f'<p style="text-align:center;padding:10px 8px">{links_html}</p>',
-        '<hr color="#ff8000">',
+  # === 判斷是否為美股市場 (S&P 500 或 Nasdaq 100) ===
+  is_us_market = "marketCapWeight" in data.columns
+
+  if is_us_market:
+    size_col = "marketCapWeight" if area_metric == "marketValueWeight" else "tradeValueWeight"
+  else:
+    # 台股邏輯 (維持不變)
+    size_col = "tradeValue"
+    if type_filter == "EQUITY":
+      size_col = "marketValueWeight" if area_metric == "marketValueWeight" else "tradeValueWeight"
+
+  # 數值轉換
+  raw_size = data.get(size_col, pd.Series([0]*len(data)))
+  if raw_size.dtype == 'object':
+    raw_size = raw_size.astype(str).str.replace(',', '')
+  
+  data["size_val"] = pd.to_numeric(raw_size, errors="coerce").fillna(0)
+  data["chg_pct"] = pd.to_numeric(data.get("changePercent"), errors="coerce").fillna(0)
+  data["price"] = pd.to_numeric(data.get("closePrice"), errors="coerce").fillna(0)
+  
+  if is_us_market:
+    data["open"] = pd.to_numeric(data.get("openPrice"), errors="coerce").fillna(data["price"])
+    data["high"] = pd.to_numeric(data.get("highPrice"), errors="coerce").fillna(data["price"])
+    data["low"] = pd.to_numeric(data.get("lowPrice"), errors="coerce").fillna(data["price"])
+    data["vol"] = pd.to_numeric(data.get("tradeVolume"), errors="coerce").fillna(0)
+    data["val"] = pd.to_numeric(data.get("tradeValue"), errors="coerce").fillna(0)
+  else:
+    data["open"] = pd.to_numeric(data.get("openPrice"), errors="coerce").fillna(0)
+    data["high"] = pd.to_numeric(data.get("highPrice"), errors="coerce").fillna(0)
+    data["low"] = pd.to_numeric(data.get("lowPrice"), errors="coerce").fillna(0)
+    data["vol"] = pd.to_numeric(data.get("tradeVolume"), errors="coerce").fillna(0)
+    data["val"] = pd.to_numeric(data.get("tradeValue"), errors="coerce").fillna(0)
+  
+  data["change_val"] = pd.to_numeric(data.get("change"), errors="coerce").fillna(0)
+  data = data[data["size_val"] > 0]
+
+  tree_data = []
+
+  def get_value_array(row):
+    return [
+      row["size_val"], row["chg_pct"], row["price"], row["size_val"],
+      row["open"], row["high"], row["low"], row["change_val"], row["vol"], row["val"]
     ]
 
-    # ── helper: call a report function, append result ─────────────────────
-    def _try(fn, label):
-        try:
-            fragment = fn(ticker)
-            if fragment:
-                parts.append(fragment)
-                parts.append('<hr color="#ff8000">')
-        except Exception as exc:
-            parts.append(
-                f'<p style="color:#c66;padding:6px"><b>{label}:</b> '
-                f'{_html.escape(str(exc))}</p><hr color="#ff8000">'
-            )
-
-    # ── All tickers (functions handle their own TW/US filtering internally) ──
-    _try(report_get_fbs_position_overview, 'FBS Position')
-    _try(report_get_position_pyramid,      'Pyramid')
-    _try(report_get_goodinfo_chart,        'GoodInfo')
-
-    # ── US-only: exclude TW / indices / FX / HK / CN ──────────────────────
-    _EXCLUDE = ['.TW', '^', '.SZ', '.SS', '.HK', '-USD', '=X']
-    if not any(e in ticker for e in _EXCLUDE):
-        _try(report_get_finviz_overview, 'FinViz')
-
-    return '\n'.join(parts)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Result page — two-tab layout, all inline HTML
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _render_result(ticker: str, days: int, chart_url: str, chart_err: str, report_body: str) -> str:
-
-    # Chart tab content
-    if chart_url:
-        chart_content = (
-            f'<iframe src="{chart_url}" frameborder="0" '
-            f'style="width:100%;height:100%;display:block;border:none"></iframe>'
-        )
+  if type_filter == "INDEX":
+    for _, row in data.iterrows():
+      tree_data.append({"name": row["name"], "value": get_value_array(row)})
+  else:
+    # === [修改] 根據來源選擇分類函數 ===
+    if is_us_market:
+      data["industry_name"] = data["industry"]
     else:
-        msg = _html.escape(chart_err) if chart_err else '未知錯誤'
-        chart_content = (
-            f'<div style="padding:2rem;color:#c66">'
-            f'<b>Chart 產生失敗：</b>{msg}</div>'
-        )
+      data["industry_name"] = data["industry"].apply(industry_label)
+    
+    grouped = data.groupby("industry_name")
+    for industry, group in grouped:
+      children = []
+      for _, row in group.iterrows():
+        children.append({
+          "name": row['name'], 
+          "value": get_value_array(row), 
+          "id": row["symbol"]
+        })
+      tree_data.append({"name": industry, "children": children})
 
-    report_content = f'''\
-<div id="report-inner" style="padding:12px;font-size:12px;font-family:Arial,Helvetica,sans-serif;transform-origin:top left;">
-  {report_body}
-</div>'''
+  return tree_data
 
-    return f'''\
+
+
+
+# ==========================================
+# PART 2: Yahoo Notify Logic
+# ==========================================
+class StockMonitor:
+  def __init__(self):
+    print("[DEBUG] Initializing StockMonitor...")
+    self.session = requests.Session(impersonate="chrome")
+    self.session.verify = False
+    
+    # Headers
+    self.headers = {
+      'authority': 'query1.finance.yahoo.com',
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'accept-language': 'zh-TW,zh-CN;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+    }
+    
+    # Initial Portfolio
+    self.portfolio = [
+      ["2454.TW", 820, 1200],
+      ["2317.TW", 102, 130],
+      ["3105.TWO", 195, 205],
+      ["4927.TW", 100, 110],
+      ["6706.TW", 157, 168]
+    ]
+    
+    # Initial PTT author list
+    self.author_list = []
+    
+    
+    # Indices for portfolio list
+    self.IDX_T = 0
+    self.IDX_F = 1
+    self.IDX_C = 2
+    self.IDX_P = 3
+    self.IDX_10MA = 4
+    self.IDX_200MA = 7
+    self.IDX_10MA_1 = 8
+    self.IDX_200MA_1 = 11
+
+    self.initialized = False
+    self.url_git_json = portfolio_url
+    
+    # Constants
+    self.DELTA_U = 0.01618
+    self.DELTA_D = -0.01618
+    self.DELTA_A = 0.00809  
+    self.DELTA_I_U   = 0.00618   # delta up for index
+    self.DELTA_I_D   = -0.00618  # delta down for index
+    self.DELTA_I_A   = 0.00382   # delta abs for index
+
+    
+    # === 新增：計數器與新聞快取 ===
+    self.run_count = 0
+    self.news_cache = []
+
+  def ma_calculation(self, ticker):
+    # print(f"[DEBUG] Calculating MA for {ticker[0]}...") # Optional trace
+    today = date.today()
+    startDate = today - timedelta(days=365)
+    endDate = today
+    startDate_epoch = int(datetime.combine(startDate, datetime.now().time()).timestamp())
+    endDate_epoch = int(datetime.combine(endDate, datetime.now().time()).timestamp())
+    crumb = "dx7e5yMCafJ"
+    
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker[0]}?period1={startDate_epoch}&period2={endDate_epoch}&interval=1d&events=history&includeAdjustedClose=true&events=div%2Csplits&crumb={crumb}"
+    
+    try:
+      r = self.session.get(url, headers=self.headers, timeout=10)
+      if r.status_code == 200:
+        data = r.json()
+        close = data["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"]
+        if None in close: return [None]*9
+        
+        precision = 4 if close[-1] < 1 else 2
+        def safe_avg(lst): return round(sum(lst)/len(lst), precision) if lst else None
+
+        ma10 = safe_avg(close[-10:])
+        ma20 = safe_avg(close[-20:])
+        ma60 = safe_avg(close[-60:])
+        ma200 = safe_avg(close[-200:])
+        ma10_1 = safe_avg(close[-11:-1])
+        ma20_1 = safe_avg(close[-21:-1])
+        ma60_1 = safe_avg(close[-61:-1])
+        ma200_1 = safe_avg(close[-201:-1])
+        
+        return [None, ma10, ma20, ma60, ma200, ma10_1, ma20_1, ma60_1, ma200_1]
+      else:
+        print(f"[WARN] MA Fetch failed for {ticker[0]}, Status: {r.status_code}")
+    except Exception as e:
+      print(f"[ERROR] MA Calc Error {ticker[0]}: {e}")
+    return [None]*9
+
+  def init_portfolio(self):
+    print("[DEBUG] Fetching Portfolio JSON from GitHub...")
+    try:
+      r = self.session.get(self.url_git_json, headers=self.headers, timeout=5)
+      if r.status_code == 200:
+        json_git = r.json()
+        self.portfolio = json_git["portfolio"]
+        print(f"[DEBUG] Portfolio loaded from GitHub. Total items: {len(self.portfolio)}")
+        self.author_list = json_git["author"]
+        print(f"[DEBUG] Author List loaded from GitHub. Total items: {len(self.author_list)}")
+      else:
+        print(f"[WARN] GitHub Portfolio fetch failed: {r.status_code}")
+    except Exception as e:
+      print(f"[ERROR] Init Portfolio failed: {e}")
+      pass
+
+    print("[DEBUG] Calculating missing MA data for portfolio...")
+    for p in self.portfolio:
+      # 當長度不足時計算，或者在 Reset 強制重算時也會補上
+      if len(p) < 12:
+        ma = self.ma_calculation(p)
+        p.extend(ma)
+      else:
+        # 如果欄位已存在 (Reset 情況)，則更新後面的 MA
+        ma = self.ma_calculation(p)
+        if len(ma) >= 9:
+            p[4:12] = ma[1:]
+
+    self.initialized = True
+    print("[DEBUG] Portfolio Initialization Complete.")
+
+
+  def _fetch_ptt_rss(self, board='Stock'):
+    """Fetch PTT articles via Atom RSS feed (works globally, no IP restriction)."""
+    import xml.etree.ElementTree as ET
+    entries = []
+    try:
+      r = requests.get(f'https://www.ptt.cc/atom/{board}.xml', timeout=10, verify=False)
+      if r.status_code == 200:
+        root = ET.fromstring(r.text)
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
+        for entry in root.findall('atom:entry', ns):
+          title = entry.find('atom:title', ns).text or ''
+          link = entry.find('atom:link', ns).get('href', '')
+          updated = entry.find('atom:updated', ns).text or ''
+          author_el = entry.find('atom:author/atom:name', ns)
+          author = author_el.text if author_el is not None else ''
+          # Extract short date from ISO timestamp (e.g. "2026-09-19T10:53:16+08:00" -> " 9/19")
+          date_short = updated
+          try:
+            dt = datetime.fromisoformat(updated)
+            date_short = f'{dt.month}/{dt.day:02d}'
+          except Exception:
+            pass
+          entries.append({'title': title, 'link': link, 'author': author, 'date': date_short})
+        print(f"[DEBUG] PTT RSS fetched {len(entries)} entries for {board}")
+    except Exception as e:
+      print(f"[ERROR] PTT RSS Error: {e}")
+    return entries
+
+
+  def get_ptt_news(self, keywords):
+    news_list = []
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36"}
+    url = 'https://www.ptt.cc/bbs/Stock/index.html'
+    try:
+      for i in range(5):
+        r = requests.get(url, headers=headers, verify=False, cookies={'over18': '1'}, timeout=10)
+        if r.status_code == 200:
+          soup = BS(r.text, 'html.parser')
+          articles = soup.select('div.r-ent')
+          paging = soup.select('div.btn-group-paging a')
+          if not paging or len(paging) < 2:
+            break
+          url = 'https://www.ptt.cc' + paging[1]['href']
+
+          for a in articles:
+            element = a.contents[3]
+            if len(element.contents) < 2: continue
+            title = element.text.strip('\n')
+            
+            matched = False
+            for k in keywords:
+              if k in title:
+                matched = True
+                break
+            
+            nrec = a.contents[1].text
+            is_hot = (nrec == '爆') or (nrec.isdigit() and int(nrec) > 20)
+
+            if matched or is_hot:
+              link = 'https://www.ptt.cc' + element.contents[1]['href']
+              date = a.contents[5].contents[5].text
+              tag = f"🔥({nrec})" if is_hot else "👀"
+              news_list.append({"date": date, "title": title, "link": link, "tag": tag})
+              
+          time.sleep(0.5)
+        else:
+          print(f"[WARN] PTT News scrape failed (status={r.status_code}), falling back to RSS")
+          break
+          
+    except Exception as e:
+      print(f"[ERROR] PTT News scrape error: {e}")
+
+    # Fallback: RSS when scraping returned nothing
+    if not news_list:
+      print("[DEBUG] PTT News: using RSS fallback")
+      for entry in self._fetch_ptt_rss('Stock'):
+        matched = any(k in entry['title'] for k in keywords)
+        if matched:
+          news_list.append({"date": entry['date'], "title": entry['title'], "link": entry['link'], "tag": "👀"})
+
+    return news_list
+
+
+
+
+  def get_ptt_tickers(self, portfolio):
+    news_list = []
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36"}
+    url = 'https://www.ptt.cc/bbs/Stock/index.html'
+    scrape_ok = False
+
+    try:
+      for _ in range(5):
+        r = requests.get(url, headers=headers, verify=False, cookies={'over18': '1'}, timeout=10)
+        if r.status_code == 200:
+          scrape_ok = True
+          r.encoding = 'utf-8'
+
+          soup = BS(r.text, 'html.parser')
+          articles = soup.select('div.r-ent')
+          paging = soup.select('div.btn-group-paging a')
+          if not paging or len(paging) < 2:
+            break
+
+          url = 'https://www.ptt.cc' + paging[1]['href']
+
+          for a in articles:
+            element = a.contents[3]
+
+            if len(element.contents) < 2:
+              continue
+
+            title = element.text.strip('\n')
+
+            for p in portfolio:
+
+              symbol = p['symbol']
+              symbol_des = (p['symbolName'].split(' '))[0]
+
+              idx = symbol.find('.')
+              if idx != -1:
+                ticker = symbol[:idx]
+              else:
+                ticker = symbol
+
+              if (ticker in title) or (symbol_des in title):
+                link = 'https://www.ptt.cc' + element.contents[1]['href']
+                date = a.contents[5].contents[5].text
+              
+                tag = f'💲(<a href="https://www.pttweb.cc/ptt-search#gsc.tab=0&gsc.q={ticker}&gsc.sort=date" target="_blank" style="color:inherit;">{ticker}</a>)'
+                news_list.append({"date": date, "title": title, "link": link, "tag": tag})
+                
+          time.sleep(0.5)
+        else:
+          print(f"[WARN] PTT Ticker scrape failed (status={r.status_code}), falling back to RSS")
+          break
+          
+    except Exception as e:
+      print(f"[ERROR] PTT Ticker scrape error: {e}")
+
+    # Fallback: RSS when scraping returned nothing
+    if not news_list and not scrape_ok:
+      print("[DEBUG] PTT Tickers: using RSS fallback")
+      for entry in self._fetch_ptt_rss('Stock'):
+        title = entry['title']
+        for p in portfolio:
+          symbol = p['symbol']
+          symbol_des = (p['symbolName'].split(' '))[0]
+          idx = symbol.find('.')
+          ticker = symbol[:idx] if idx != -1 else symbol
+          if (ticker in title) or (symbol_des in title):
+            tag = f'💲(<a href="https://www.pttweb.cc/ptt-search#gsc.tab=0&gsc.q={ticker}&gsc.sort=date" target="_blank" style="color:inherit;">{ticker}</a>)'
+            news_list.append({"date": entry['date'], "title": title, "link": entry['link'], "tag": tag})
+
+    return news_list
+
+
+
+  
+  def get_ptt_authors(self, board, names):
+    news_list = []
+    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Mobile Safari/537.36"}
+    url = f'https://www.ptt.cc/bbs/{board}/index.html'
+    scrape_ok = False
+    
+    try:
+      for _ in range(10):
+        r = requests.get(url, headers=headers, verify=False, cookies={'over18': '1'}, timeout=10)
+        if r.status_code == 200:
+          scrape_ok = True
+          r.encoding = 'utf-8'
+          
+          soup = BS(r.text, 'html.parser')
+          articles = soup.select('div.r-ent')
+          paging = soup.select('div.btn-group-paging a')
+          if not paging or len(paging) < 2:
+            break
+
+          url = 'https://www.ptt.cc' + paging[1]['href']
+
+          for a in articles:
+            element = a.contents[3]
+
+            if len(element.contents) < 2:
+              continue
+
+            title = element.text.strip('\n')     
+            meta = a.contents[5]
+            name = meta.contents[1].text
+
+            for n in names:
+
+              if n == name:
+                link = 'https://www.ptt.cc' + element.contents[1]['href']
+                date = a.contents[5].contents[5].text
+                tag = f'👤(<a href="https://www.pttweb.cc/user/{n}" target="_blank" style="color:inherit;">{n}</a>)'
+                news_list.append({"date": date, "title": title, "link": link, "tag": tag})
+
+          time.sleep(0.5)
+        else:
+          print(f"[WARN] PTT Author scrape failed (status={r.status_code}), falling back to RSS")
+          break
+
+    except Exception as e:
+      print(f"[ERROR] PTT Author scrape error: {e}")
+
+    # Fallback: RSS when scraping returned nothing
+    if not news_list and not scrape_ok:
+      print("[DEBUG] PTT Authors: using RSS fallback")
+      for entry in self._fetch_ptt_rss(board):
+        if entry['author'] in names:
+          n = entry['author']
+          tag = f'👤(<a href="https://www.pttweb.cc/user/{n}" target="_blank" style="color:inherit;">{n}</a>)'
+          news_list.append({"date": entry['date'], "title": entry['title'], "link": entry['link'], "tag": tag})
+
+    return news_list
+
+
+
+
+  def check_signals(self, p_idx, price, price_1):
+    # (Logic unchanged, omitted for brevity)
+    p = self.portfolio[p_idx]
+
+    # 取用欄位
+    ma10 = p[4]
+    ma20 = p[5]
+    ma60 = p[6]
+    ma200 = p[7]
+    ma10_1 = p[8]
+    ma20_1 = p[9]
+    ma60_1 = p[10]
+    ma200_1 = p[11]
+    price_low = p[1]
+    price_high = p[2]
+
+    symbol = p[0]
+    msgs = []
+
+    # 輔助函數:根據箭頭自動添加顏色 class
+    def styled_msg(text):
+      if '↗' in text:
+        return f'<span class="up">{text}</span>'
+      elif '↘' in text:
+        return f'<span class="down">{text}</span>'
+      elif '-Fall' in text:
+        return f'<span class="down">{text}</span>'
+      else:
+        return f'<span>{text}</span>'
+
+    # --------------------------
+    # 1. FLOOR / CEILING cross
+    # --------------------------
+    if price_low is not None:
+      if (price > price_low) and (price_1 <= price_low):
+        msgs.append(styled_msg(f"↗L({price_low})"))
+      if (price < price_low) and (price_1 >= price_low):
+        msgs.append(styled_msg(f"↘L({price_low})"))
+
+    if price_high is not None:
+      if (price > price_high) and (price_1 <= price_high):
+        msgs.append(styled_msg(f"↗H({price_high})"))
+      if (price < price_high) and (price_1 >= price_high):
+        msgs.append(styled_msg(f"↘H({price_high})"))
+
+    # --------------------------
+    # 2. SMA10 / SMA20 / SMA60 / SMA200 Trend Cross
+    # --------------------------
+    if ma10_1 is not None:
+      if (price > ma10) and (price_1 <= ma10_1):
+        msgs.append(styled_msg(f"↗MA10({ma10})"))
+      if (price < ma10) and (price_1 >= ma10_1):
+        text = f"↘MA10({ma10})"
+        if hasattr(self, "macd_w_is_fall"):
+          if symbol in self.macd_w_is_fall and self.macd_w_is_fall[symbol] is True:
+            text += " MACD-Fall"
+        msgs.append(styled_msg(text))
+
+    if ma20_1 is not None:
+      if (price > ma20) and (price_1 <= ma20_1):
+        msgs.append(styled_msg(f"↗MA20({ma20})"))
+      if (price < ma20) and (price_1 >= ma20_1):
+        text = f"↘MA20({ma20})"
+        if ma10 is not None and ma10 > ma20:
+          text += " JUMP-Fall"
+        msgs.append(styled_msg(text))
+
+    if ma60_1 is not None:
+      if (price > ma60) and (price_1 <= ma60_1):
+        msgs.append(styled_msg(f"↗MA60({ma60})"))
+      if (price < ma60) and (price_1 >= ma60_1):
+        msgs.append(styled_msg(f"↘MA60({ma60})"))
+
+    if ma200_1 is not None:
+      if (price > ma200) and (price_1 <= ma200_1):
+        msgs.append(styled_msg(f"↗MA200({ma200})"))
+      if (price < ma200) and (price_1 >= ma200_1):
+        msgs.append(styled_msg(f"↘MA200({ma200})"))
+
+    # --------------------------
+    # 3. SMA Crossing (MA10-20, MA20-60, MA10-60)
+    # --------------------------
+    if ma10_1 is not None and ma60_1 is not None:
+      if (ma10 > ma60) and (ma10_1 <= ma60_1):
+        msgs.append(styled_msg(f"MA10↗60({ma10},{ma60})"))
+      if (ma10 < ma60) and (ma10_1 >= ma60_1):
+        msgs.append(styled_msg(f"MA10↘60({ma10},{ma60})"))
+
+    if ma10_1 is not None and ma20_1 is not None:
+      if (ma10 > ma20) and (ma10_1 <= ma20_1):
+        msgs.append(styled_msg(f"MA10↗20({ma10},{ma20})"))
+      if (ma10 < ma20) and (ma10_1 >= ma20_1):
+        msgs.append(styled_msg(f"MA10↘20({ma10},{ma20})"))
+
+    if ma20_1 is not None and ma60_1 is not None:
+      if (ma20 > ma60) and (ma20_1 <= ma60_1):
+        msgs.append(styled_msg(f"MA20↗60({ma20},{ma60})"))
+      if (ma20 < ma60) and (ma20_1 >= ma60_1):
+        msgs.append(styled_msg(f"MA20↘60({ma20},{ma60})"))
+
+    # --------------------------
+    # 4. 回傳結果
+    # --------------------------
+    return " | ".join(msgs)
+
+  
+
+
+  def get_fitx_data(self):
+    try:
+      url = "https://histock.tw/stock/module/function.aspx?m=stocktop2017&no=FITX"
+      r = self.session.get(url, headers=self.headers, timeout=5)
+      
+      if r.status_code == 200:
+        raw_html = r.text.split('~')[0]
+        soup = BS(raw_html, 'html.parser')
+        values = soup.select('div.ci_value')
+        
+        if len(values) >= 3:
+          price = float(values[0].text.strip().replace(',', ''))
+          change_val_str = values[1].text.strip().replace('▼', '-').replace('▲', '')
+          change_pct_str = values[2].text.strip()
+
+          try:
+            change_val = float(change_val_str)
+          except:
+            change_val = 0.0
+          
+          try:
+            delta = float(change_pct_str.replace('%', '')) / 100
+          except:
+            delta = 0.0
+
+          return {
+            "symbol": "FITX",
+            "name": "台指期",
+            "price": price,
+            "change": change_pct_str,
+            "change_val": change_val, # [新增]
+            "alert": "",
+            "delta": delta,
+            "delta_val": 0.0 # [新增] 台指期可能沒有 "監控起始價" 的概念，暫設為 0
+          }
+    except Exception as e:
+      print(f"[ERROR] FITX Fetch Error: {e}")
+    
+    return None  
+
+
+
+
+  def run_check(self):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [DEBUG] Starting Monitor run_check (Count: {self.run_count})")
+    if not self.initialized:
+      self.init_portfolio()
+      
+    # ==========================================
+    # [新增] 每 30 次迴圈，更新一次所有股票的 MA
+    # ==========================================
+    if self.run_count > 0 and self.run_count % 30 == 0:
+      print(f"[{datetime.now().strftime('%H:%M:%S')}] [DEBUG] Updating Portfolio Moving Averages...")
+      for p in self.portfolio:
+        # p[0] 是 symbol (e.g., "2330.TW")
+        # 重新計算 MA
+        new_ma = self.ma_calculation(p)
+        
+        # ma_calculation 回傳格式: [None, ma10, ma20, ma60, ma200, ma10_1, ma20_1, ma60_1, ma200_1]
+        # self.portfolio (p) 的結構: 
+        # idx 0:Symbol, 1:Low, 2:High, 3:Price, 
+        # idx 4:MA10, 5:MA20, 6:MA60, 7:MA200, 8:MA10_1, ... 11:MA200_1
+        
+        # 確保有抓到資料才更新
+        if len(new_ma) >= 9:
+          # 使用 List Slicing 直接替換掉舊的 MA 數值 (從 index 4 到 11)
+          p[4:12] = new_ma[1:]
+          # print(f"[DEBUG] Updated MA for {p[0]}")
+      print("[DEBUG] MA Update Complete.")
+
+    rows = []
+    ticker_news = []
+    
+    chunk_len = 20
+    for c in range(0, len(self.portfolio), chunk_len):
+      chunk = self.portfolio[c:c+chunk_len]
+      tickers = [p[0] for p in chunk]
+      tickers_url = ','.join(tickers)
+      url = yahoo_url + tickers_url
+      
+      # print(f"[DEBUG] Fetching chunk {c//chunk_len + 1} from Yahoo...") # Trace chunk
+      
+      try:
+        r = self.session.get(url, headers=self.headers, timeout=5)
+        if r.status_code == 200:
+          data = r.json()
+          
+          if self.run_count % 30 == 0:
+            print("[DEBUG] Fetching PTT Ticker News...")
+            ticker_news += self.get_ptt_tickers(data) 
+          
+          for item in data:
+            symbol = item['symbol']
+            if 'price' not in item or 'raw' not in item['price']: continue
+            
+            try:
+              price = float(item['price']['raw'])
+              price_1 = float(item.get('regularMarketPreviousClose', {}).get('raw', price))
+            except:
+              continue
+              
+            for i, p in enumerate(self.portfolio):
+              if p[0] == symbol:
+                name = item.get('symbolName', '').split(' ')[0]
+                
+                change_percent_str = item.get('changePercent', '0%')                
+                # 嘗試提取 change 數值，若失敗則設為 0
+                try:
+                  change_val = float(item.get('change', {}).get('raw', 0))
+                except (TypeError, ValueError):
+                  change_val = 0.0
+                
+                p_last = p[self.IDX_P]
+                if p_last is None: p[self.IDX_P] = price
+                
+                delta = 0
+                delta_val = 0 # 新增 delta_val
+                if p[self.IDX_P]:
+                  delta = (price - p[self.IDX_P]) / p[self.IDX_P]
+                  delta_val = price - p[self.IDX_P] # 計算相對於監控起始價的變動值
+                  p[self.IDX_P] = price
+
+                # 1. 收集所有警示訊息到一個 List
+                alert_msgs = []
+
+                # A. 急劇變動
+                if symbol in INDEX_LIST: delta_a_judge = self.DELTA_I_A
+                else: delta_a_judge = self.DELTA_A
+                  
+                if abs(delta) > delta_a_judge:
+                  print(f"[ALERT] {symbol} {name} Delta: {delta:.4f}") # ALERT Debug
+                  if delta > 0: 
+                    alert_msgs.append(f'<span class="up">▲急拉 {delta*100:.2f}%</span>')
+                  else: 
+                    alert_msgs.append(f'<span class="down">▼急殺 {delta*100:.2f}%</span>')
+                    
+                # B. 支撐壓力
+                if p[self.IDX_F] and price < p[self.IDX_F]:
+                  alert_msgs.append(f'<span class="down">跌破 {p[self.IDX_F]}</span>')
+                if p[self.IDX_C] and price > p[self.IDX_C]:
+                  alert_msgs.append(f'<span class="up">突破 {p[self.IDX_C]}</span>')
+                
+                # C. 均線交叉
+                # cross_msg = self.check_signals(i, price, price_1)
+                # if cross_msg: alert_msgs.append(cross_msg)
+
+                # 2. 合併為字串 (移除隱藏邏輯，直接顯示)
+                display_alert = " ".join(alert_msgs)
+                additional_alert = self.check_signals(i, price, price_1)
+                
+                # 3. 組合最終 alert (用 <br> 分隔,不需要 alert_style 了)
+                final_alert = ""
+                if display_alert:
+                  final_alert = display_alert
+                if additional_alert:
+                  if final_alert:
+                    final_alert += "<br>" + additional_alert
+                  else:
+                    final_alert = additional_alert
+                
+                rows.append({
+                  "symbol": symbol,
+                  "name": name,
+                  "price": price,
+                  "change": change_percent_str, # 這裡維持百分比字串
+                  "change_val": change_val,     # [新增] 傳遞變動數值
+                  "alert": final_alert,
+                  "delta": delta,
+                  "delta_val": delta_val        # [新增] 傳遞 Delta 數值
+                })
+        else:
+           print(f"[WARN] Yahoo API Non-200 Status: {r.status_code}")
+      except Exception as e:
+        print(f"[ERROR] Yahoo Update error: {e}")
+        traceback.print_exc()
+    
+    # ==========================================
+    # [新增] 抓取台指期 (使用獨立 Function)
+    # ==========================================
+    fitx_data = self.get_fitx_data()
+    if fitx_data:
+      rows.append(fitx_data)
+    
+    #=== 定義輔助函數 ==
+    def safe_parse_change(change_str):
+      # 安全解析 change 百分比字串，返回絕對值
+      try:
+        return abs(float(str(change_str).rstrip('%')))
+      except (ValueError, AttributeError, TypeError):
+        return 0.0
+    
+    rows.sort(key=lambda x: (
+      -abs(x.get('delta', 0)),                   # Level 1:delta絕對值（大到小）
+      -safe_parse_change(x.get('change', '0%'))  # Level 2:change絕對值（大到小）
+    ))
+    
+    # 排序但保留 delta
+    #rows.sort(key=lambda x: abs(x.get('delta', 0)), reverse=True)
+    
+    
+    keywords = [p[0].split('.')[0] for p in self.portfolio]
+
+    # 只有當計數器是 0 或 30 的倍數時，才真正去爬蟲
+    if self.run_count % 30 == 0:
+      print(f"[{datetime.now().strftime('%H:%M:%S')}] [DEBUG] Updating PTT News (Keywords/Authors)...")
+      #self.news_cache = ticker_news + self.get_ptt_news(keywords) +  self.get_ptt_authors("Stock", PTT_AUTHORS)
+      self.news_cache = ticker_news + self.get_ptt_news(keywords) +  self.get_ptt_authors("Stock", self.author_list)
+      print(f"[DEBUG] Total News Found: {len(self.news_cache)}")
+    
+    self.run_count += 1
+    # === 修改結束 ===
+
+    return {
+      "timestamp": datetime.now(ZoneInfo('Asia/Taipei')).strftime('%H:%M:%S'),
+      "rows": rows,
+      "news": self.news_cache  # 這裡改成回傳 cache
+    }
+
+
+
+
+monitor = StockMonitor()
+
+# ==========================================
+# PART 3: Web Application
+# ==========================================
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{_html.escape(ticker)} &mdash; Stock Analyzer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🚀Stock Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
   <style>
-    :root {{
-      --accent:   #ff8000;
-      --bg:       #1a1a2e;
-      --bar-bg:   #16213e;
-      --tab-act:  #0f3460;
-      --text:     #e0e0e0;
-    }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    html, body {{
-      height: 100%;
-      background: var(--bg);
-      color: var(--text);
-      font-family: Arial, Helvetica, sans-serif;
-      overflow: hidden;
-    }}
-    /* Full-viewport flex column — dvh avoids iOS Safari address-bar overlap */
-    .layout {{
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
-      height: 100dvh;
-    }}
-    /* ── Top bar ── */
-    .topbar {{
-      flex-shrink: 0;
-      background: var(--bar-bg);
-      border-bottom: 2px solid var(--accent);
-      display: flex;
-      align-items: center;
-      padding: .4rem 1rem;
-      gap: 1rem;
-    }}
-    .topbar .title {{
-      flex: 1;
-      font-size: 1rem;
-      font-weight: bold;
-      color: #fff;
-    }}
-    .topbar a {{
-      color: var(--accent);
-      text-decoration: none;
-      font-size: .82rem;
-    }}
-    .topbar a:hover {{ text-decoration: underline; }}
-    /* ── Tab bar ── */
-    .tab-bar {{
-      flex-shrink: 0;
-      display: flex;
-      background: var(--bar-bg);
-    }}
-    .tab-btn {{
-      padding: .5rem 1.6rem;
-      min-width: 0;
-      flex: 1 1 auto;
-      cursor: pointer;
-      border: none;
-      background: transparent;
-      color: #999;
-      font-size: .88rem;
-      border-bottom: 3px solid transparent;
-      transition: all .15s;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }}
-    .tab-btn:hover {{ color: #fff; }}
-    .tab-btn.active {{
-      color: #fff;
-      border-bottom-color: var(--accent);
-      background: var(--tab-act);
-    }}
-    /* ── Panels ── */
-    .tab-panel {{
-      flex: 1;
-      overflow: hidden;
-      display: none;
-    }}
-    .tab-panel.active {{
-      display: flex;
-      flex-direction: column;
-    }}
-    /* Chart panel: iframe fills everything */
-    #panel-chart {{ overflow: hidden; }}
-    /* Report panel: scrollable both axes for wide tables/iframes on mobile */
-    #panel-report {{ overflow-x: auto; overflow-y: auto; background: #fff; color: #222; }}
-    /* ── Report table styles (mirrors report.py HTML output) ── */
-    #panel-report * {{
-      font-size: 12px;
-      font-family: Arial, Helvetica, sans-serif, "Microsoft JhengHei";
-    }}
-    #panel-report a {{ color: #0066cc; }}
-    #panel-report table {{ border-collapse: collapse; }}
-    #panel-report td, #panel-report th {{
-      border: 1px solid #FDEBD2;
-      text-align: left;
-      padding: 5px;
-    }}
-    #panel-report .is-negative {{ color: #008000; }}
-    #panel-report .is-positive {{ color: #ff0000; }}
-    #panel-report .t3r1         {{ color: #ff0000; }}
-    #panel-report .snapshot-td2 {{
-      color: #000;
-      text-decoration: none;
-      border: 1px solid #d3d3d3;
-      white-space: nowrap;
-    }}
-    #panel-report .snapshot-td2-cp {{
-      color: #000;
-      text-decoration: none;
-      border: 1px solid #d3d3d3;
-      cursor: pointer;
-      white-space: nowrap;
-    }}
-    #panel-report .fullview-ratings-outer {{
-      border: 1px solid #d3d3c3;
-    }}
-    #panel-report td.fullview-ratings-inner {{
-      border: 1px solid #d3d3c3;
-    }}
-    #panel-report .body-table-rating-downgrade {{
-      color: #dd3333;
-      text-decoration: none;
-      background: #fff0f0;
-    }}
-    #panel-report .body-table-rating-upgrade {{
-      color: #009900;
-      text-decoration: none;
-      background: #f0fff0;
-    }}
-    #panel-report .body-table-rating-neutral {{
-      color: #333;
-      text-decoration: none;
-      background: #f0f0f0;
-    }}
+  :root {
+    --o-brand:#0f6cbd; --o-brand-dark:#0c5aa0; --o-bar:#0f6cbd;
+    --o-ribbon:#faf9f8; --o-bg:#f3f2f1; --o-card:#ffffff; --o-border:#edebe9;
+    --o-text:#201f1e; --o-text-sub:#605e5c; --o-hover:#f3f2f1;
+    --o-shadow:0 1.6px 3.6px rgba(0,0,0,.10),0 .3px .9px rgba(0,0,0,.07);
+  }
+  body {
+    background-color: var(--o-bg); margin: 0; padding: 0; overflow: hidden;
+    font-family:'Segoe UI','Segoe UI Web (West European)',-apple-system,system-ui,'Microsoft JhengHei','微軟正黑體',sans-serif;
+    color: var(--o-text);
+  }
+  .container-fluid { padding: 0 !important; margin: 0 !important; }
+  .row { margin: 0 !important; }
+  .col-lg-8 { padding: 0 !important; } 
+  .card { border:1px solid var(--o-border) !important; border-radius:8px !important; margin:0; background:var(--o-card); box-shadow:var(--o-shadow); overflow:hidden; }
+  .card-header { background:#fbfafa !important; color:var(--o-text) !important; border-bottom:1px solid var(--o-border); font-weight:600; }
+  .card-body { padding: 0 !important; }
+
+  .interval-bar {
+    margin-left: auto;
+    font-size: 12px;
+    color: #555;
+    white-space: nowrap;
+  }
+  .interval-bar select {
+    font-size: 11px;
+    padding: 1px 3px;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .interval-bar label { margin-right: 4px; }
+  #chart-container {
+    width: 100%;
+    height: calc(100vh - 112px);
+    background: var(--o-card); border:1px solid var(--o-border); border-radius:8px; box-shadow: var(--o-shadow);
+  }
+
+  .notify-panel { height: calc(100vh - 112px); overflow: hidden; background: var(--o-card); border:1px solid var(--o-border); border-radius:8px; box-shadow: var(--o-shadow); display:flex; flex-direction:column; }
+  
+  /* 表格樣式 */
+  .table-custom { font-size: 13px; width: 100%; margin-bottom: 0; }
+  .table-custom th { background:#fbfafa; color: var(--o-text-sub); padding: 8px 12px; font-weight: 600; font-size:12px; border-bottom:1px solid var(--o-border); }
+  .table-custom td { padding: 9px 12px; vertical-align: middle; border-bottom: 1px solid var(--o-border); }
+  .table-custom tr:hover { background-color: var(--o-hover); }
+  
+  .news-item { padding: 8px 10px; border-bottom: 1px solid #eee; font-size: 0.85rem; line-height: 1.4; }
+  .news-link {
+    color: #212529; /* 未點擊時：深黑色 (原本 text-dark 的顏色) */
+    text-decoration: none;
+  }
+  .news-link:visited {
+    color: #adb5bd; /* 已點擊時：淺灰色 */
+  }
+  .news-link:hover {
+    color: #000;    /* 滑鼠移過去變全黑 */
+    text-decoration: underline; /* 增加底線提示 */
+  }
+  
+  .up { color: #d13438; font-weight: bold; }
+  .down { color: #107c10; font-weight: bold; }
+  .neutral { color: #6c757d; font-weight: normal; }  /* 灰色,較淡 */
+  
+  /* 警示標籤 */
+  .alert-tag { font-size: 0.8rem; font-weight: bold; }
+  
+  /* Popup 容器 */
+  .stock-popup {
+    position: fixed;
+    display: none;
+    z-index: 9999;
+    background: white;
+    border: 2px solid #333;
+    border-radius: 8px;
+    padding: 10px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    pointer-events: none; /* 避免圖片擋住滑鼠事件 */
+  }
+
+  .stock-popup img {
+    display: block;
+    max-width: 800px;
+    max-height: 600px;
+    width: auto;
+    height: auto;
+  }
+
+  .stock-popup .loading {
+    padding: 20px;
+    text-align: center;
+    color: #666;
+  }
+
+  /* 股票代碼 hover 效果 */
+  .stock-symbol-hover {
+    cursor: pointer;
+    position: relative;
+  }
+
+  .stock-symbol-hover:hover {
+    background-color: #e3f2fd;
+  }
+  
+  /* [新增] Tooltip 圖片預設樣式 (電腦版) */
+  .chart-tooltip-img {
+    width: 800px;
+    height: auto;
+    display: block;
+  }
+
+  /* ========================================= */
+  /* [核心修正] Mobile Mode 強制滿版樣式 */
+  /* ========================================= */
+  
+  /* 1. Body 開放滾動 */
+  body.mobile-mode { 
+    overflow: auto !important; 
+  }
+
+  /* 2. Monitor 區塊：固定高度、移除左邊框、增加下分隔線 */
+  body.mobile-mode .notify-panel { 
+    height: 500px;      
+    overflow-y: auto; 
+    border-left: none; 
+    border-bottom: 5px solid #ddd;
+  }
+
+  /* 3. Heatmap 區塊：固定高度 */
+  body.mobile-mode #chart-container {
+    height: 600px;
+  }
+  body.mobile-mode .interval-bar {
+    margin-left: 0;
+    width: 100%;
+    border-top: 1px solid #eee;
+    padding-top: 4px;
+  }
+
+  /* Tooltip 兩欄佈局 */
+  .tooltip-two-columns {
+    display: flex;
+    gap: 20px;
+  }
+
+  .tooltip-left-column {
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .tooltip-right-column {
+    flex: 1;
+    min-width: 180px;
+    border-left: 1px solid #ddd;
+    padding-left: 15px;
+  }
+
+  /* [新增] Mobile Mode: 改為垂直堆疊 */
+  body.mobile-mode .tooltip-two-columns {
+    flex-direction: column;  /* 垂直排列 */
+    gap: 10px;
+  }
+
+  body.mobile-mode .tooltip-right-column {
+    border-left: none;           /* 移除左邊框 */
+    border-top: 1px solid #ddd;  /* 改為上邊框 */
+    padding-left: 0;
+    padding-top: 10px;
+  }
+
+  /* 4. Tooltip 圖片縮小 */
+  body.mobile-mode .chart-tooltip-img {
+    width: 200px !important;
+  }
+
+  /* 5. [關鍵修正] 強制改變排列與寬度 */
+  body.mobile-mode .main-row {
+    flex-direction: column !important; /* Monitor(左欄) 在手機上置頂 */
+  }
+
+  /* 這裡就是解決無法滿版的核心代碼 */
+  body.mobile-mode .main-row > div {
+    width: 100% !important;     /* 無視 col-lg-* 的寬度限制 */
+    max-width: 100% !important; /* 確保不被限制 */
+    flex: 0 0 100% !important;  /* 強制 Flex 佔滿整行 */
+    padding: 0 !important;      /* 移除欄位預設間距，達成邊對邊滿版 */
+  }
+
+  /* === Portfolio Sparkline Grid === */
+  #portfolio-grid {
+    display: none;
+    width: 100%;
+    height: calc(100vh - 60px);
+    overflow-y: auto;
+    padding: 8px;
+  }
+  body.mobile-mode #portfolio-grid {
+    height: auto;
+    max-height: 600px;
+  }
+  .pf-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(285px, 1fr));
+    gap: 8px;
+  }
+  .pf-card {
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 7px 9px 6px;
+    background: #fff;
+  }
+  .pf-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .pf-symbol { font-weight: bold; font-size: 13px; color: #222; }
+  .pf-name { font-size: 10px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; margin-bottom: 2px; }
+  .pf-price { font-size: 13px; font-weight: bold; }
+  .pf-chart-title { font-size: 10px; color: #666; margin-bottom: 2px; }
+  .pf-chart-area {
+    width: 100%;
+    height: 90px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f9f9f9;
+    border-radius: 3px;
+  }
+
+  /* ===== Outlook chrome: top command bar + ribbon ===== */
+  .col-lg-8 { padding: 8px !important; }
+  .col-lg-4 { padding: 8px !important; }
+  /* ===== Inbox tabs (Monitor / PTT News) ===== */
+  .o-tabstrip { flex:none; display:flex; align-items:center; justify-content:space-between; padding:4px 8px 0 8px; border-bottom:1px solid var(--o-border); }
+  .o-tabs { display:flex; gap:2px; }
+  .o-tab { border:none; background:transparent; padding:8px 14px; font-size:14px; font-weight:600; color:var(--o-text-sub); cursor:pointer; border-bottom:2px solid transparent; }
+  .o-tab:hover { color:var(--o-text); }
+  .o-tab.active { color:var(--o-brand-dark); border-bottom-color:var(--o-brand); }
+  .o-tab-tools { display:flex; align-items:center; gap:6px; padding-bottom:4px; }
+  .o-tabpane { flex:1 1 auto; overflow-y:auto; min-height:0; }
+  .iframe-view { display:none; width:100%; height:calc(100vh - 112px); background:var(--o-card); border:1px solid var(--o-border); border-radius:8px; box-shadow:var(--o-shadow); overflow:hidden; }
+  .iframe-view iframe { width:100%; height:100%; border:none; }
+  body.mobile-mode .iframe-view { height:600px; }
+  body.mobile-mode .iframe-view iframe { width:100%; margin-left:0; }
+  .o-tabpane .table-custom thead th { position:sticky; top:0; z-index:2; }
+  /* ===== Stealth mode: fake email list ===== */
+  #fake-mail { height:calc(100vh - 112px); overflow-y:auto; background:var(--o-card); border:1px solid var(--o-border); border-radius:8px; box-shadow:var(--o-shadow); }
+  body.mobile-mode #fake-mail { height:600px; }
+  .mail-toolbar { padding:12px 16px; font-size:15px; font-weight:600; border-bottom:1px solid var(--o-border); display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; background:var(--o-card); z-index:2; }
+  .mail-item { display:flex; gap:10px; padding:10px 14px; border-bottom:1px solid var(--o-border); cursor:pointer; align-items:flex-start; }
+  .mail-item:hover { background:var(--o-hover); }
+  .mail-dot { width:8px; height:8px; border-radius:50%; background:var(--o-brand); margin-top:7px; flex:none; visibility:hidden; }
+  .mail-item.unread .mail-dot { visibility:visible; }
+  .mail-item.unread .mail-from, .mail-item.unread .mail-subj { font-weight:700; }
+  .mail-avatar { width:34px; height:34px; border-radius:50%; font-weight:600; font-size:13px; display:grid; place-items:center; flex:none; }
+  .mail-main { min-width:0; flex:1; }
+  .mail-row1 { display:flex; justify-content:space-between; }
+  .mail-from { font-size:14px; color:var(--o-text); }
+  .mail-time { font-size:12px; color:var(--o-text-sub); flex:none; margin-left:8px; }
+  .mail-subj { font-size:13px; color:var(--o-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .mail-prev { font-size:12px; color:var(--o-text-sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .o-topbar { height:48px; background:var(--o-bar); display:flex; align-items:center; color:#fff; gap:4px; padding-right:4px; }
+  .o-waffle { width:48px; height:48px; display:grid; place-items:center; cursor:pointer; border:none; background:transparent; color:#fff; }
+  .o-waffle:hover { background:rgba(255,255,255,.12); }
+  .o-appname { font-size:18px; font-weight:600; letter-spacing:.2px; padding:0 12px 0 4px; white-space:nowrap; }
+  .o-search { flex:1; max-width:640px; margin:0 auto; height:32px; background:#fff; border-radius:4px; display:flex; align-items:center; padding:0 10px; color:var(--o-text-sub); font-size:14px; }
+  .o-search svg { margin-right:8px; flex:none; }
+  .o-search input { flex:1; min-width:0; border:none; outline:none; background:transparent; font-size:14px; color:var(--o-text); font-family:inherit; }
+  .o-search input::placeholder { color:var(--o-text-sub); }
+  .o-topbar-right { display:flex; align-items:center; gap:2px; margin-left:auto; flex:none; }
+  .o-iconbtn { width:40px; height:48px; border:none; background:transparent; color:#fff; cursor:pointer; font-size:16px; display:grid; place-items:center; }
+  .o-iconbtn:hover { background:rgba(255,255,255,.12); }
+  .o-ribbon { height:48px; background:var(--o-ribbon); border-bottom:1px solid var(--o-border); display:flex; align-items:center; padding:0 12px; gap:8px; overflow-x:auto; }
+  .o-ribbon .btn-group { display:flex; gap:2px; }
+  .o-ribbon .btn { border:none !important; background:transparent !important; color:var(--o-text) !important; border-radius:4px !important; padding:6px 12px !important; font-size:14px !important; box-shadow:none !important; white-space:nowrap; }
+  .o-ribbon .btn:hover { background:var(--o-hover) !important; }
+  .o-ribbon .btn.active { background:#e1eefb !important; color:var(--o-brand-dark) !important; font-weight:600; }
+  .o-ribbon-sep { width:1px; height:24px; background:var(--o-border); margin:0 4px; flex:none; }
+  body.mobile-mode .o-ribbon { height:auto; flex-wrap:wrap; padding:6px 12px; }
+  /* 手機頂部列：縮小各元件、讓搜尋框吸收剩餘寬度，確保 ⚙❔ET 與鈴鐺同排不溢出 */
+  body.mobile-mode .o-topbar { gap:0; padding-right:2px; }
+  body.mobile-mode .o-waffle { width:40px; }
+  body.mobile-mode .o-appname { font-size:14px; padding:0 4px; max-width:34vw; overflow:hidden; text-overflow:ellipsis; display:inline-block; vertical-align:middle; }
+  body.mobile-mode .o-search { max-width:none; }
+  body.mobile-mode .o-iconbtn { width:34px; font-size:15px; }
   </style>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highcharts/12.3.0/highcharts.min.js"></script>
 </head>
 <body>
-<div class="layout">
 
-  <div class="topbar">
-    <span class="title">&#x1F4C8; {_html.escape(ticker)} &nbsp;&middot;&nbsp; {days}d</span>
-    <a href="/">&#8592; 返回</a>
+<div class="o-topbar">
+  <button class="o-waffle" title="App launcher">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="#fff">
+      <rect x="1" y="1" width="4" height="4" rx="1"/><rect x="8" y="1" width="4" height="4" rx="1"/><rect x="15" y="1" width="4" height="4" rx="1"/>
+      <rect x="1" y="8" width="4" height="4" rx="1"/><rect x="8" y="8" width="4" height="4" rx="1"/><rect x="15" y="8" width="4" height="4" rx="1"/>
+      <rect x="1" y="15" width="4" height="4" rx="1"/><rect x="8" y="15" width="4" height="4" rx="1"/><rect x="15" y="15" width="4" height="4" rx="1"/>
+    </svg>
+  </button>
+  <span class="o-appname">Stock Dashboard</span>
+  <div class="o-search">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#605e5c" stroke-width="1.5">
+      <circle cx="7" cy="7" r="5"/><line x1="11" y1="11" x2="15" y2="15"/>
+    </svg>
+    <input id="inbox-search" type="text" placeholder="搜尋股票代碼 / 名稱 / 新聞" oninput="applyInboxFilter()" autocomplete="off">
   </div>
-
-  <div class="tab-bar">
-    <button class="tab-btn active" onclick="switchTab('chart',this)">
-      &#x1F4CA; 圖表 Chart
-    </button>
-    <button class="tab-btn" onclick="switchTab('report',this)">
-      &#x1F4CB; 報告 Report
-    </button>
+  <div class="o-topbar-right">
+    <button class="o-iconbtn" title="通知">🔔</button>
+    <button class="o-iconbtn" title="設定">⚙</button>
+    <button class="o-iconbtn" title="說明" onclick="toggleStealth()">❔</button>
   </div>
-
-  <div id="panel-chart"  class="tab-panel active">{chart_content}</div>
-  <div id="panel-report" class="tab-panel">{report_content}</div>
-
 </div>
+
+<div class="o-ribbon">
+  <div class="btn-group btn-group-sm">
+    <button class="btn btn-outline-dark active" onclick="setMarket(this, 'twse', 'INDEX')">上市指數</button>
+    <button class="btn btn-outline-dark" onclick="setMarket(this, 'twse', 'EQUITY')">上市個股</button>
+    <button class="btn btn-outline-dark" onclick="setMarket(this, 'otc', 'INDEX')">上櫃指數</button>
+    <button class="btn btn-outline-dark" onclick="setMarket(this, 'otc', 'EQUITY')">上櫃個股</button>
+    <button class="btn btn-outline-dark" onclick="setMarket(this, 'sp500', 'EQUITY')">S&P 500</button>
+    <button class="btn btn-outline-dark" onclick="setMarket(this, 'ndx', 'EQUITY')">NASDAQ 100</button>
+    <button class="btn btn-outline-secondary" onclick="showPortfolioView(this)">Portfolio</button>
+    <button class="btn btn-outline-secondary" onclick="showIframeView(this, 'iframe-tw-trend')">TW-Trend</button>
+    <button class="btn btn-outline-secondary" onclick="showIframeView(this, 'iframe-tw-ratio')">TW-Ratio</button>
+    <button class="btn btn-outline-secondary" onclick="showIframeView(this, 'iframe-tw-breath')">TW-Breath</button>
+    <button class="btn btn-outline-secondary" onclick="showIframeView(this, 'iframe-tw-today')">TW-Today</button>
+    <button class="btn btn-outline-secondary" onclick="showIframeView(this, 'iframe-tw-market')">TW-Market</button>
+  </div>
+  <div class="o-ribbon-sep"></div>
+  <div id="area-metric-selector" style="font-size:14px;">
+    <label style="cursor:pointer"><input type="radio" name="area_metric" value="tradeValueWeight" checked onchange="updateHeatmap()"> 成交值</label>
+    <label class="ms-2" style="cursor:pointer"><input type="radio" name="area_metric" value="marketValueWeight" onchange="updateHeatmap()"> 市值</label>
+  </div>
+  <div class="interval-bar">
+    <span>更新間隔：</span>
+    <label>Heatmap
+      <select id="interval-heatmap" onchange="restartHeatmapInterval()">
+        <option value="30000">30s</option>
+        <option value="60000">1m</option>
+        <option value="120000">2m</option>
+        <option value="300000" selected>5m</option>
+        <option value="600000">10m</option>
+      </select>
+    </label>
+    <label>Portfolio
+      <select id="interval-portfolio" onchange="restartPortfolioInterval()">
+        <option value="30000">30s</option>
+        <option value="60000">1m</option>
+        <option value="120000">2m</option>
+        <option value="300000" selected>5m</option>
+        <option value="600000">10m</option>
+      </select>
+    </label>
+    <label>Monitor
+      <select id="interval-monitor" onchange="restartMonitorInterval()">
+        <option value="30000">30s</option>
+        <option value="60000">1m</option>
+        <option value="120000" selected>2m</option>
+        <option value="300000">5m</option>
+        <option value="600000">10m</option>
+      </select>
+    </label>
+  </div>
+</div>
+
+<div class="container-fluid">
+  <div class="row main-row">
+  <div class="col-lg-4">
+    <div class="notify-panel">
+      <div class="o-tabstrip">
+        <div class="o-tabs">
+          <button class="o-tab active" data-tab="monitor" onclick="switchInboxTab('monitor')">Monitor</button>
+          <button class="o-tab" data-tab="news" onclick="switchInboxTab('news')">PTT / News</button>
+        </div>
+        <div class="o-tab-tools">
+          <span class="badge bg-secondary" id="nt-time">--:--</span>
+          <span id="audio-btn" style="cursor:pointer; font-size:1.1rem;" onclick="toggleSound(event)" title="點擊以啟用音效">🔇</span>
+          <button class="btn btn-sm btn-outline-secondary" style="padding: 0px 6px; font-size: 0.8rem;" onclick="resetMonitor()">Reset</button>
+        </div>
+      </div>
+
+      <div id="tab-monitor" class="o-tabpane">
+        <table class="table-custom">
+          <thead>
+            <tr>
+              <th style="width: 20%">股票</th>
+              <th style="width: 20%">價/幅</th>
+              <th style="width: 15%">變動率</th>
+              <th style="width: 45%">警示</th>
+            </tr>
+          </thead>
+          <tbody id="stock-table-body">
+            <tr><td colspan="4" class="text-center text-muted">載入中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div id="tab-news" class="o-tabpane" style="display:none;">
+        <div id="news-container">
+          <div class="text-center p-3 text-muted">載入中...</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="col-lg-8">
+    <div id="chart-container"></div>
+    <div id="portfolio-grid"></div>
+
+    <div id="iframe-tw-trend" class="iframe-view">
+      <iframe data-src="https://c-a-d-e-n-z-a.github.io/webpage/group_trend.html" loading="lazy"></iframe>
+    </div>
+    <div id="iframe-tw-ratio" class="iframe-view">
+      <iframe data-src="https://c-a-d-e-n-z-a.github.io/webpage/margin_ratio.html" loading="lazy"></iframe>
+    </div>
+    <div id="iframe-tw-breath" class="iframe-view">
+      <iframe data-src="https://c-a-d-e-n-z-a.github.io/webpage/breadth_high_low.html" loading="lazy"></iframe>
+    </div>
+    <div id="iframe-tw-today" class="iframe-view">
+      <iframe data-src="https://finlab.finance/stocks/today" loading="lazy"></iframe>
+    </div>
+    <div id="iframe-tw-market" class="iframe-view">
+      <iframe data-src="https://ai.finlab.tw/tw_market/" loading="lazy"></iframe>
+    </div>
+
+    <div id="fake-mail" style="display:none;">
+      <div class="mail-toolbar">
+        <span>通知</span>
+        <span style="font-weight:400; color:var(--o-text-sub); font-size:12px;">依日期排序 ↓ · 3 未讀</span>
+      </div>
+      <div class="mail-list">
+        <div class="mail-item unread"><span class="mail-dot"></span><div class="mail-avatar" style="background:#dff6dd;">📈</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Price Alert</span><span class="mail-time">09:12</span></div><div class="mail-subj">觸及目標價 $184.00</div><div class="mail-prev">已達到你在觀察清單設定的價格提醒。</div></div></div>
+        <div class="mail-item unread"><span class="mail-dot"></span><div class="mail-avatar" style="background:#e1eefb;">🔔</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Market News</span><span class="mail-time">09:01</span></div><div class="mail-subj">台股開盤上漲 0.8%，半導體領漲</div><div class="mail-prev">加權指數站上季線，權值股表現強勢。</div></div></div>
+        <div class="mail-item unread"><span class="mail-dot"></span><div class="mail-avatar" style="background:#d4eefb;">🌐</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Global Markets</span><span class="mail-time">08:45</span></div><div class="mail-subj">Fed keeps rates steady; futures edge higher</div><div class="mail-prev">US index futures rose modestly after the decision.</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#dce8f7;">📊</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Watchlist Update</span><span class="mail-time">08:20</span></div><div class="mail-subj">觀察清單今日異動摘要</div><div class="mail-prev">12 檔上漲、5 檔下跌，整體成交量放大。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#efdbff;">📅</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Earnings Reminder</span><span class="mail-time">07:55</span></div><div class="mail-subj">本週財報行事曆：3 檔持股公布</div><div class="mail-prev">留意季度營收與 EPS 年增率的變化。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#e1eefb;">💹</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Tech News</span><span class="mail-time">07:40</span></div><div class="mail-subj">AI 晶片需求帶動供應鏈拉貨動能</div><div class="mail-prev">分析師上修下半年出貨預估。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#fff4ce;">💰</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Dividend Notice</span><span class="mail-time">07:15</span></div><div class="mail-subj">除息提醒：2 檔持股即將除息</div><div class="mail-prev">本週除息日與填息機率一覽。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#d4eefb;">📰</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Market Recap</span><span class="mail-time">昨天</span></div><div class="mail-subj">昨日收盤回顧與盤後重點</div><div class="mail-prev">三大指數收紅，資金流向科技類股。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#fde7e9;">⚠️</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Risk Alert</span><span class="mail-time">昨天</span></div><div class="mail-subj">VIX 波動度指數上升至 18.5</div><div class="mail-prev">市場情緒轉趨謹慎，注意部位控管。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#fff4ce;">🛢️</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Commodities</span><span class="mail-time">昨天</span></div><div class="mail-subj">油價走穩，黃金小幅回落</div><div class="mail-prev">市場評估供給前景與美元走勢。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#dff6dd;">🧾</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">Portfolio Digest</span><span class="mail-time">週一</span></div><div class="mail-subj">每週投資組合摘要已產生</div><div class="mail-prev">本週報酬 +1.4%，波動度較上週下降。</div></div></div>
+        <div class="mail-item"><span class="mail-dot"></span><div class="mail-avatar" style="background:#e2e2e2;">⚙</div><div class="mail-main"><div class="mail-row1"><span class="mail-from">System</span><span class="mail-time">週一</span></div><div class="mail-subj">行情與籌碼資料同步完成</div><div class="mail-prev">已更新至最新交易日。</div></div></div>
+      </div>
+    </div>
+  </div>
+  </div>
+</div>
+
 <script>
-  // ── Report scale: fit wide content to panel width ──────────────────────
-  function adjustReportScale() {{
-    var panel = document.getElementById('panel-report');
-    var inner = document.getElementById('report-inner');
-    if (!inner || !panel) return;
-    inner.style.zoom = '';            // reset to measure natural width
-    var naturalW = inner.scrollWidth;
-    var panelW   = panel.clientWidth;
-    if (naturalW > panelW && panelW > 0) {{
-      inner.style.zoom = panelW / naturalW;
-    }}
-  }}
-  window.addEventListener('resize', adjustReportScale);
+let chartInstance = null;
+let currentMarket = 'twse';
+let currentType = 'INDEX';
+let heatmapInterval = null;
+let monitorInterval = null;
 
-  // ── Deferred iframe loading (avoid rendering in hidden/zero-size panel) ──
-  document.addEventListener('DOMContentLoaded', function() {{
-    document.querySelectorAll('.tab-panel:not(.active) iframe').forEach(function(f) {{
-      if (f.src && f.src !== 'about:blank') {{
-        f.setAttribute('data-deferred-src', f.src);
-        f.src = 'about:blank';
-      }}
-    }});
-  }});
+function fmtNum(n) { if(n === undefined) return '0'; return n.toLocaleString('en-US'); }
+function fmtFloat(n, d=2) { if(n === undefined) return '0.00'; return n.toFixed(d); }
 
-  function switchTab(name, btn) {{
-    document.querySelectorAll('.tab-panel').forEach(function(p) {{
-      p.classList.remove('active');
-    }});
-    document.querySelectorAll('.tab-btn').forEach(function(b) {{
-      b.classList.remove('active');
-    }});
-    var panel = document.getElementById('panel-' + name);
-    panel.classList.add('active');
-    btn.classList.add('active');
-    // Restore deferred iframes on first visit to this panel
-    panel.querySelectorAll('iframe[data-deferred-src]').forEach(function(f) {{
-      f.src = f.getAttribute('data-deferred-src');
-      f.removeAttribute('data-deferred-src');
-    }});
-    if (name === 'report') {{ adjustReportScale(); }}
-  }}
+// Inbox 分頁切換 (Monitor / PTT News)
+function switchInboxTab(tab) {
+  document.querySelectorAll('.o-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.getElementById('tab-monitor').style.display = (tab === 'monitor') ? '' : 'none';
+  document.getElementById('tab-news').style.display = (tab === 'news') ? '' : 'none';
+}
+
+// 頂部搜尋：即時過濾 Monitor 清單與 PTT/新聞 (雙欄同步)
+function applyInboxFilter() {
+  const input = document.getElementById('inbox-search');
+  const q = (input ? input.value : '').trim().toLowerCase();
+  document.querySelectorAll('#stock-table-body > tr').forEach(tr => {
+    tr.style.display = (!q || tr.textContent.toLowerCase().includes(q)) ? '' : 'none';
+  });
+  document.querySelectorAll('#news-container > .news-item').forEach(item => {
+    item.style.display = (!q || item.textContent.toLowerCase().includes(q)) ? '' : 'none';
+  });
+}
+
+// 隱藏看盤 (boss key)：右側切換成模擬 email 清單，再按一次還原
+let stealthMode = false;
+let stealthPrev = null;
+function toggleStealth() {
+  const chart = document.getElementById('chart-container');
+  const pf = document.getElementById('portfolio-grid');
+  const mail = document.getElementById('fake-mail');
+  stealthMode = !stealthMode;
+  const iframes = document.querySelectorAll('.iframe-view');
+  if (stealthMode) {
+    stealthPrev = { chart: chart.style.display, pf: pf.style.display, iframes: Array.from(iframes).map(el => el.style.display) };
+    chart.style.display = 'none';
+    pf.style.display = 'none';
+    iframes.forEach(el => el.style.display = 'none');
+    mail.style.display = 'block';
+  } else {
+    if (stealthPrev) {
+      chart.style.display = stealthPrev.chart;
+      pf.style.display = stealthPrev.pf;
+      if (stealthPrev.iframes) {
+        Array.from(iframes).forEach((el, i) => el.style.display = stealthPrev.iframes[i] || 'none');
+      }
+    }
+    mail.style.display = 'none';
+  }
+}
+
+
+
+
+function setMarket(btn, market, type) {
+  hidePortfolioView();
+  hideIframeViews();
+  document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  currentMarket = market;
+  currentType = type;
+  updateHeatmap();
+}
+
+let portfolioInterval = null;
+
+function restartHeatmapInterval() {
+  clearInterval(heatmapInterval);
+  const ms = parseInt(document.getElementById('interval-heatmap').value);
+  heatmapInterval = setInterval(conditionalUpdateHeatmap, ms);
+}
+
+function restartPortfolioInterval() {
+  clearInterval(portfolioInterval);
+  if (document.getElementById('portfolio-grid').style.display !== 'none' &&
+      document.getElementById('portfolio-grid').style.display !== '') {
+    const ms = parseInt(document.getElementById('interval-portfolio').value);
+    portfolioInterval = setInterval(loadPortfolioSparklines, ms);
+  }
+}
+
+function restartMonitorInterval() {
+  clearInterval(monitorInterval);
+  const ms = parseInt(document.getElementById('interval-monitor').value);
+  monitorInterval = setInterval(updateNotify, ms);
+}
+
+function showPortfolioView(btn) {
+  hideIframeViews();
+  document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('chart-container').style.display = 'none';
+  document.getElementById('area-metric-selector').style.display = 'none';
+  document.getElementById('portfolio-grid').style.display = 'block';
+  loadPortfolioSparklines();
+  clearInterval(portfolioInterval);
+  const ms = parseInt(document.getElementById('interval-portfolio').value);
+  portfolioInterval = setInterval(loadPortfolioSparklines, ms);
+}
+
+function hidePortfolioView() {
+  clearInterval(portfolioInterval);
+  portfolioInterval = null;
+  document.getElementById('chart-container').style.display = '';
+  document.getElementById('area-metric-selector').style.display = '';
+  document.getElementById('portfolio-grid').style.display = 'none';
+}
+
+function hideIframeViews() {
+  document.querySelectorAll('.iframe-view').forEach(el => el.style.display = 'none');
+}
+
+function showIframeView(btn, id) {
+  hidePortfolioView();
+  hideIframeViews();
+  document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('chart-container').style.display = 'none';
+  document.getElementById('area-metric-selector').style.display = 'none';
+  const container = document.getElementById(id);
+  container.style.display = 'block';
+  // Lazy-load iframe src on first activation
+  const iframe = container.querySelector('iframe[data-src]');
+  if (iframe && !iframe.src) {
+    iframe.src = iframe.getAttribute('data-src');
+  }
+}
+
+async function loadPortfolioSparklines() {
+  const grid = document.getElementById('portfolio-grid');
+  grid.innerHTML = '<div class="text-center text-muted p-3">Loading...</div>';
+
+  try {
+    // 1. 取得 monitor 資料 (含 symbol/name/price/change)
+    const monitorRes = await fetch('/api/monitor');
+    const monitorData = await monitorRes.json();
+    const rows = (monitorData.rows || []).sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+    if (rows.length === 0) {
+      grid.innerHTML = '<div class="text-center text-muted p-3">No portfolio data</div>';
+      return;
+    }
+
+    // 2. 分批抓 sparkline (每批最多 15 個)
+    const symbols = rows.map(r => r.symbol);
+    const BATCH_SIZE = 15;
+    const chunks = [];
+    for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+      chunks.push(symbols.slice(i, i + BATCH_SIZE));
+    }
+
+    const chartMap = {};
+    for (const chunk of chunks) {
+      const res = await fetch(`/api/sparkline_multi?symbols=${chunk.join(',')}`);
+      const json = await res.json();
+      const list = Array.isArray(json) ? json : (json.data || []);
+      list.forEach(item => {
+        const chart = item.chart;
+        if (chart && chart.meta && chart.meta.symbol) {
+          chartMap[chart.meta.symbol] = chart;
+        }
+      });
+    }
+
+    // 3. 渲染卡片
+    let html = '<div class="pf-grid">';
+    rows.forEach(row => {
+      const safeId = 'pf_' + row.symbol.replace(/[^a-zA-Z0-9]/g, '_');
+      let changeVal = parseFloat(row.change.replace('%', ''));
+      const colorStyle = changeVal >= 0 ? 'color:#ff3333;' : 'color:#00cc44;';
+      html += `
+        <div class="pf-card">
+          <div class="pf-card-header">
+            <span class="pf-symbol">${row.symbol.split('.')[0]}</span>
+            <span class="pf-price" style="${colorStyle}">${row.price}</span>
+          </div>
+          <div class="pf-name">${row.name}</div>
+          <div id="${safeId}_title" class="pf-chart-title">即時走勢</div>
+          <div id="${safeId}" class="pf-chart-area"><span style="color:#999;font-size:11px;">Loading...</span></div>
+        </div>`;
+    });
+    html += '</div>';
+    grid.innerHTML = html;
+
+    // 4. 逐一繪製 SVG
+    rows.forEach(row => {
+      const safeId = 'pf_' + row.symbol.replace(/[^a-zA-Z0-9]/g, '_');
+      const chartData = chartMap[row.symbol];
+      if (chartData) {
+        _drawSparklineSVG(safeId, chartData);
+      } else {
+        const el = document.getElementById(safeId);
+        if (el) el.innerHTML = '<span style="color:#999;font-size:11px;">N/A</span>';
+      }
+    });
+
+  } catch (err) {
+    console.error('Portfolio sparklines error:', err);
+    grid.innerHTML = `<div class="text-center text-danger p-3">Error: ${err.message}</div>`;
+  }
+}
+
+
+
+
+// === 1. 畫圖函式 (修正灰色昨收線樣式) ===
+
+// Inner renderer: takes pre-fetched chartData object
+function _drawSparklineSVG(containerId, chartData) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  try {
+    const timestamps = chartData.timestamp;
+    const closes = chartData.indicators.quote[0].close;
+    const meta = chartData.meta;
+
+    const prevClose = meta.chartPreviousClose || meta.previousClose;
+    const limitUp = meta.limitUpPrice;
+    const limitDown = meta.limitDownPrice;
+
+    let minT, maxT;
+    const period = meta.tradingPeriods?.[0]?.[0];
+    if (period && period.start && period.end) {
+      minT = period.start;
+      maxT = period.end;
+    } else {
+      if (timestamps && timestamps.length > 0) {
+        minT = timestamps[0];
+        maxT = timestamps[timestamps.length - 1];
+      } else {
+        minT = 0; maxT = 1;
+      }
+    }
+
+    const points = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      const t = timestamps[i];
+      const p = closes[i];
+      if (p !== null && p !== undefined && t >= minT && t <= maxT) {
+        points.push({ t: t, p: p });
+      }
+    }
+
+    if (points.length === 0) {
+      container.innerHTML = '<span style="color:#ccc;font-size:12px;">等待開盤</span>';
+      return;
+    }
+
+    let minP, maxP;
+    const hasLimitPrice = (limitUp && limitUp !== '-' && limitDown && limitDown !== '-');
+    if (hasLimitPrice) {
+      maxP = parseFloat(limitUp);
+      minP = parseFloat(limitDown);
+    } else {
+      minP = points[0].p; maxP = points[0].p;
+      points.forEach(pt => {
+        if (pt.p < minP) minP = pt.p;
+        if (pt.p > maxP) maxP = pt.p;
+      });
+      if (prevClose) {
+        if (prevClose < minP) minP = prevClose;
+        if (prevClose > maxP) maxP = prevClose;
+      }
+      if (maxP === minP) { maxP *= 1.01; minP *= 0.99; }
+    }
+
+    const width = 300;
+    const height = 110;
+    const padding = 5;
+    const getX = (t) => ((t - minT) / (maxT - minT)) * width;
+    const getY = (p) => height - padding - ((p - minP) / (maxP - minP)) * (height - 2 * padding);
+
+    const svgPoints = points.map(pt => `${getX(pt.t).toFixed(1)},${getY(pt.p).toFixed(1)}`).join(" ");
+
+    let prevCloseLine = "";
+    if (prevClose && prevClose >= minP && prevClose <= maxP) {
+      const yPrev = getY(prevClose).toFixed(1);
+      prevCloseLine = `<line x1="0" y1="${yPrev}" x2="${width}" y2="${yPrev}" stroke="#999" stroke-width="0.8" opacity="0.6" />`;
+    }
+
+    const lastPrice = points[points.length - 1].p;
+    const refPrice = prevClose || points[0].p;
+    const color = lastPrice >= refPrice ? "#ff3333" : "#00cc44";
+
+    const precision = lastPrice < 1 ? 4 : 2;
+    const chgPct = refPrice ? ((lastPrice - refPrice) / refPrice * 100) : 0;
+    const chgSign = chgPct >= 0 ? '+' : '';
+    const prevCloseStr = prevClose ? prevClose.toFixed(precision) : 'N/A';
+    const titleEl = document.getElementById(containerId + '_title');
+    if (titleEl) {
+      const infoSpan = `<span style="font-weight:normal; color:${color};">&nbsp;(現 ${lastPrice.toFixed(precision)} / 昨 ${prevCloseStr} / ${chgSign}${chgPct.toFixed(2)}%)</span>`;
+      titleEl.innerHTML = titleEl.textContent.trim() + infoSpan;
+    }
+
+    container.innerHTML = `
+      <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" style="width:100%; height:100%; background:transparent;">
+        ${prevCloseLine}
+        <polyline points="${svgPoints}"
+              fill="none"
+              stroke="${color}"
+              stroke-width="2"
+              stroke-linejoin="round"
+              vector-effect="non-scaling-stroke" />
+      </svg>
+    `;
+    container.setAttribute('data-loaded', 'true');
+    container.style.background = 'transparent';
+    container.style.border = 'none';
+
+  } catch (err) {
+    console.error("Chart Error:", err);
+    container.innerHTML = '<span style="color:#ccc;font-size:12px;">N/A</span>';
+  }
+}
+
+async function renderSparklineSVG(containerId, symbol) {
+  const container = document.getElementById(containerId);
+  if (!container || container.getAttribute('data-loaded')) return;
+
+  const proxyUrl = `/api/sparkline/${encodeURIComponent(symbol)}`;
+
+  try {
+    const response = await fetch(proxyUrl);
+    const json = await response.json();
+    const chartData = Array.isArray(json) ? json[0].chart : json.data?.[0]?.chart;
+
+    if (!chartData) throw new Error("無圖表資料");
+    _drawSparklineSVG(containerId, chartData);
+
+  } catch (err) {
+    console.error("Chart Error:", err);
+    if (container) container.innerHTML = '<span style="color:#ccc;font-size:12px;">N/A</span>';
+  }
+}
+
+
+
+
+// === 2. Tooltip 格式化 (修改佈局以填滿) ===
+function tooltipFormatter(info) {
+  var val = info.data.value;
+  if (!val) { val = info.value; }
+
+  var styleTitle = 'font-weight:bold; border-bottom:1px solid #ccc; margin-bottom:8px; padding-bottom:5px; color:#000; font-size:16px;';
+  // 稍微增加左側的最小寬度
+  var styleRow = 'display:flex; justify-content:space-between; font-size:13px; color:#000; line-height:1.5; min-width:140px;';
+
+  if (Array.isArray(val)) {
+    var name = info.name;
+    var symbol = info.data.id || '';
+
+    var chgPct = fmtFloat(val[1]);
+    var close = fmtFloat(val[2]);
+    var open = fmtFloat(val[4]);
+    var high = fmtFloat(val[5]);
+    var low = fmtFloat(val[6]);
+    var change = fmtFloat(val[7]);
+    var vol = fmtNum(val[8]);
+    var valMoney = fmtNum(val[9]);
+
+    var chgColor = val[1] >= 0 ? '#ff3333' : '#00cc44';
+    
+    var safeSymbol = symbol.replace(/[^a-zA-Z0-9]/g, '');
+    var chartId = 'spark_' + safeSymbol + '_' + Date.now();
+
+    // 1. 左側資訊區 (固定最小寬度)
+    var leftContent = `
+      <div style="margin-right: 15px;">
+        <div style="${styleRow}"><span>收盤：</span><b>${close}</b></div>
+        <div style="${styleRow}"><span>漲跌：</span><span style="color:${chgColor};">${change} (${chgPct}%)</span></div>
+        <div style="${styleRow}"><span>開盤：</span><span>${open}</span></div>
+        <div style="${styleRow}"><span>最高：</span><span>${high}</span></div>
+        <div style="${styleRow}"><span>最低：</span><span>${low}</span></div>
+    `;
+    if (currentType === 'EQUITY') {
+      leftContent += `
+        <div style="border-top:1px dashed #ddd; margin:4px 0;"></div>
+        <div style="${styleRow}"><span>量：</span><span>${vol}</span></div>
+        <div style="${styleRow}"><span>額：</span><span>${valMoney}</span></div>
+      `;
+    }
+    leftContent += `</div>`;
+
+    // 2. 右側圖表區 (【關鍵修改】Flex 填滿)
+    var rightContent = '';
+    if (symbol) {
+      rightContent = `
+        <div style="flex: 1; display: flex; flex-direction: column;">
+           <div id="${chartId}_title" style="font-size:12px; color:#666; margin-bottom:4px; font-weight:bold;">即時走勢</div>
+           <div id="${chartId}" style="width:100%; height:110px; display:flex; align-items:center; justify-content:center; background:#f9f9f9; border:1px solid #eee; border-radius:4px;">
+            <span style="color:#999;font-size:12px;">Loading...</span>
+           </div>
+        </div>
+      `;
+      setTimeout(() => renderSparklineSVG(chartId, symbol), 100);
+    }
+
+    // 3. 下方大圖區
+    var bottomImage = '';
+    if (currentType === 'EQUITY' && symbol) {
+      var imgUrl = '';
+      if (currentMarket === 'sp500' || currentMarket === 'ndx') {
+        imgUrl = `https://charts2.finviz.com/chart.ashx?t=${symbol.replace(/\./g, '-')}&ta=1&ty=c&p=d&s=l`;
+      } else {
+        imgUrl = `https://stock.wearn.com/finance_chart.asp?stockid=${symbol.split('.')[0]}&timeblock=270&sma1=10&sma2=20&sma3=60&volume=1`;
+      }
+      bottomImage = `
+        <div style="margin-top:10px; padding-top:10px; border-top:1px solid #eee; text-align:center;">
+          <img src="${imgUrl}" style="max-width:100%; height:auto; display:block; margin:auto;">
+        </div>
+      `;
+    }
+
+    // 主容器增加一點寬度，上半部使用 Flex 佈局
+    return `
+      <div style="padding:8px; min-width:320px; font-family:'Roboto', sans-serif;">
+        <div style="${styleTitle}">${name} (${symbol})</div>
+        <div style="display:flex; align-items: flex-start;">
+          ${leftContent}
+          ${rightContent}
+        </div>
+        ${bottomImage}
+      </div>
+    `;
+  } 
+  
+  return `${info.name}: ${val}`;
+}
+
+
+
+
+function labelFormatterIndex(params) {
+  if (Array.isArray(params.value)) {
+  var price = params.value[2] ? params.value[2].toFixed(2) : '0.00';
+  var chg = params.value[1] ? params.value[1].toFixed(2) + '%' : '0.00%';
+  return params.name + '\\n' + price + ' | ' + chg;f
+  }
+  return params.name;
+}
+
+
+
+
+function labelFormatter(params) {
+  if (Array.isArray(params.value)) {
+  var symbol = params.data.id || ''; 
+  var price = params.value[2] ? params.value[2].toFixed(2) : '0.00';
+  var chg = params.value[1] ? params.value[1].toFixed(2) + '%' : '0.00%';
+  return '{name|' + params.name + '(' + symbol + ')}\\n{val|' + price + ' | ' + chg + '}';
+  }
+  return params.name;
+}
+
+
+
+
+// 檢查是否在交易時間內(含週末判斷)
+function isTwTradingHours() {
+  const now = new Date();
+  // 轉換為台北時間 (UTC+8)
+  const taipeiTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Taipei' }));
+      
+  const day = taipeiTime.getDay(); // 0=週日, 6=週六
+  if (day === 0 || day === 6) return false; // 週末不交易
+
+  const hours = taipeiTime.getHours();
+  const minutes = taipeiTime.getMinutes();
+  const currentTime = hours * 60 + minutes; // 轉換為分鐘
+  
+  const startTime = 8 * 60 + 30;  // 08:30 = 510 分鐘
+  const endTime = 14 * 60 + 30;   // 14:30 = 870 分鐘
+  
+  return currentTime >= startTime && currentTime <= endTime;
+}
+
+
+
+
+
+// 檢查是否在美股交易時間內
+function isUsTradingHours() {
+  const now = new Date();
+  // 轉換為美東時間 (ET)
+  const etTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  
+  const day = etTime.getDay(); // 0=週日, 6=週六
+  if (day === 0 || day === 6) return false; // 週末不交易
+  
+  const hours = etTime.getHours();
+  const minutes = etTime.getMinutes();
+  const currentTime = hours * 60 + minutes;
+  
+  const startTime = 9 * 60 + 30;   // 09:30
+  const endTime = 16 * 60;          // 16:00
+  
+  return currentTime >= startTime && currentTime <= endTime;
+}
+
+
+
+
+// 條件式更新 Heatmap
+function conditionalUpdateHeatmap() {
+  if (currentMarket === 'sp500' || currentMarket === 'ndx') {
+    if (isUsTradingHours()) {
+      console.log('美股交易時間內，更新 Heatmap');
+      updateHeatmap();
+    } else {
+      console.log('美股非交易時間，跳過更新');
+    }
+  } else if (currentMarket === 'twse' || currentMarket === 'otc') {
+    if (isTwTradingHours()) {
+      console.log('台股交易時間內，更新 Heatmap');
+      updateHeatmap();
+    } else {
+      console.log('台股非交易時間，跳過更新');
+    }
+  } else {
+    // 其他市場直接更新
+    console.log(`${currentMarket} 市場，直接更新`);
+    updateHeatmap();
+  }
+}
+
+
+
+
+async function updateHeatmap() {
+  // 檢查實例是否已存在
+  if(!chartInstance) {
+    console.log("[DEBUG] Initializing ECharts Instance...");
+    chartInstance = echarts.init(document.getElementById('chart-container'));
+
+    // 雙擊事件
+    chartInstance.on('dblclick', function(params) {
+      if (params.data && params.data.id) {
+        const symbol = params.data.id;
+        if (symbol) {
+          if (currentMarket === 'sp500' || currentMarket === 'ndx') {
+            // 美股：開啟 TradingView
+            window.open(`https://www.tradingview.com/chart/?symbol=${symbol}`, '_blank');
+          } else {
+            // 台股：開啟 CMoney 論壇
+            const stockCode = symbol.split('.')[0];
+            window.open(`https://www.cmoney.tw/forum/stock/${stockCode}`, '_blank');
+          }
+        } 
+      }
+    });
+  }
+
+  chartInstance.showLoading();
+  const areaVal = document.querySelector('input[name="area_metric"]:checked').value;
+  
+  // [新增] 判斷是否為手機模式
+  const isMobile = document.body.classList.contains('mobile-mode');
+
+  try {
+    const res = await fetch(`/twheatmap/api/data?market=${currentMarket}&type=${currentType}&area=${areaVal}`);
+    const treeData = await res.json();
+    
+    const option = {
+      tooltip: { 
+        formatter: tooltipFormatter,
+        // [優化] 手機版 tooltip 限制在容器內，避免超出螢幕
+        confine: true, 
+        backgroundColor: 'rgba(255, 255, 255, 0.95)',
+        borderColor: '#ccc',
+        borderWidth: 1,
+        padding: 10
+      },
+      visualMap: {
+        type: 'continuous', dimension: 1, min: -10, max: 10,
+        inRange: { color: ['#31C950', '#FFF085', '#FB2C36'] }, 
+        show: true, orient: 'vertical', left: 10, top: 'middle',
+        itemHeight: 80, textStyle: { color: '#000'}
+      },
+      series: [{
+        type: 'treemap', 
+        data: treeData, 
+        breadcrumb: { show: true }, 
+        leafDepth: null, 
+        
+        // [關鍵修正] 如果是手機模式，關閉 roam (拖曳/縮放)，讓使用者可以滑動網頁
+        roam: !isMobile, 
+        width: '100%', height: '100%', top: 0, bottom: 0, left: 0, right: 0,
+        levels: currentType === 'INDEX' ? [] : [
+          { itemStyle: { borderColor: '#fff', borderWidth: 0, gapWidth: 0 } },
+          { colorSaturation: [0, 1], itemStyle: { borderColor: '#555', borderWidth: 1, gapWidth: 2 }, upperLabel: { show: true, height: 30, color: '#000', fontWeight: 'bold' } },
+          { colorSaturation: [0, 1], itemStyle: { borderColor: '#fff', borderWidth: 1, gapWidth: 1 }, label: { show: true, position: 'insideTopLeft', formatter: labelFormatter, rich: { name: { fontSize: 14, fontWeight: 'bold', color: '#000'}, val: { fontSize: 12, color: '#333'} } } }
+        ],
+        label: { show: true, formatter: labelFormatterIndex, fontSize: 14, color: '#000' }
+      }]
+    };
+    chartInstance.setOption(option);
+    chartInstance.hideLoading();
+  } catch(e) { 
+    console.error('[ERROR] Heatmap update failed:', e); 
+    chartInstance.hideLoading();
+  }
+}
+
+
+
+
+// [新增] 將 Yahoo 代碼轉換為 TradingView URL
+function getYahooToTradingViewUrl(symbol) {
+  let tvSymbol = symbol;
+
+  // 1. 特殊指數與期貨對照表
+  const indexMap = {
+    '^TWII': 'TWSE:TAIEX',      // 加權指數
+    '^TWOII': 'TPEX:TPEX',      // 櫃買指數
+    'FITX': 'TAIFEX:TX1!',      // 台指期 (使用 TX1! 代表連續月)
+    '^GSPC': 'SP:SPX',          // S&P 500
+    '^NDX': 'TVC:NDX',          // Nasdaq 100
+    '^IXIC': 'TVC:IXIC',        // Nasdaq Composite
+    '^DJI': 'DJ:DJI',           // 道瓊
+    '^N225': 'TVC:NI225',       // Nikkei 225
+    '^KS11': 'KRX:KOSPI',       // KOSPI Composite Index
+    '^VIX': 'VIX',
+    '^VXN': 'VXN',
+    'ES=F': 'CME_MINI:ES1!',    // S&P 500 期貨
+    'NQ=F': 'CME_MINI:NQ1!',    // Nasdaq 期貨
+    'YM=F': 'CBOT_MINI:YM1!',   // 道瓊期貨
+    'TWD=X': 'USDTWD',
+    'JPYTWD=X': 'JPYTWD',
+    'BTC-USD': 'BTCUSD',
+    'ETH-USD': 'ETHUSD',
+    'SOL-USD': 'SOLUSD',
+    'DOGE-USD': 'DOGEUSD'
+  };
+
+  if (indexMap[symbol]) {
+    tvSymbol = indexMap[symbol];
+  }
+  
+  // 2. 台股上市 (Yahoo: 2330.TW -> TV: TWSE:2330)
+  else if (symbol.endsWith('.TW')) {
+    tvSymbol = 'TWSE:' + symbol.replace('.TW', '');
+  } 
+  // 3. 台股上櫃 (Yahoo: 3105.TWO -> TV: TPEX:3105)
+  else if (symbol.endsWith('.TWO')) {
+    tvSymbol = 'TPEX:' + symbol.replace('.TWO', '');
+  }
+  // 4. 滬深 (Yahoo: 000300.SS -> TV: SSE:000300)
+  else if (symbol.endsWith('.SS')) {
+    tvSymbol = 'SSE:' + symbol.replace('.SS', '');
+  }  
+  // 5. 美股 (Yahoo: BRK-B -> TV: BRK.B, 其他通常通用)
+  else {
+    tvSymbol = symbol.replace('-', '.'); 
+  }
+
+  // 回傳 TradingView 超級圖表連結
+  return `https://www.tradingview.com/chart/?symbol=${tvSymbol}`;
+}
+
+
+
+
+// [新增] 取得社群討論區連結 (CMoney / 富途)
+function getCommunityLink(symbol) {
+
+  // 1. 特殊指數與期貨對照表
+  const communityMap = {
+    '^TWII': 'https://www.cmoney.tw/forum/market',      // 加權指數
+    '^TWOII': 'https://www.cmoney.tw/forum/stock/TWC00',      // 櫃買指數
+    'FITX': 'https://www.cmoney.tw/forum/futures/TXF1?s=p',      // 台指期
+    '^GSPC': 'https://www.futunn.com/hk/index/.SPX-US/community',           // S&P 500
+    '^IXIC': 'https://www.futunn.com/hk/index/.IXIC-US',        // Nasdaq Composite
+    '^DJI': 'https://www.futunn.com/hk/index/.DJI-US',            // 道瓊
+  };
+
+  // 修正點：如果對照表有資料，直接回傳該網址
+  if (communityMap[symbol]) {
+    return communityMap[symbol];
+  } 
+  
+  // 2. 判斷是否包含 .TW (涵蓋 .TW 與 .TWO)
+  else if (symbol.includes('.TW')) {
+    // 移除 .TW 或 .TWO，只保留代碼 (e.g., 2330.TW -> 2330)
+    const code = symbol.split('.')[0];
+    return `https://www.cmoney.tw/forum/stock/${code}`;
+  } 
+  
+  // 3. 美股或其他：使用富途牛牛 (需加上 -US)
+  else {
+    return `https://www.futunn.com/hk/stock/${symbol}-US/community`;
+  }
+}
+
+
+
+
+// [新增] 音效狀態旗標
+let soundOn = false;
+const alertAudio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
+
+// 依 soundOn 更新喇叭圖示外觀
+function refreshAudioBtn() {
+  const btn = document.getElementById('audio-btn');
+  if (!btn) return;
+  btn.innerText = soundOn ? "🔊" : "🔇";
+  btn.title = soundOn ? "音效已啟用 (點擊關閉)" : "點擊以啟用音效";
+  btn.style.color = soundOn ? "#198754" : "";
+}
+
+
+
+
+// [新增] 嘗試啟用音效 (解鎖瀏覽器限制)
+// 喇叭按鈕：切換音效開/關
+// event.stopPropagation() 是關鍵 —— 阻止 click 冒泡到 document 的全域監聽器，
+// 否則關閉後會立刻被全域監聽器重新啟用 (原本按鈕失效的主因)。
+function toggleSound(event) {
+  if (event) event.stopPropagation();
+  if (soundOn) {
+    soundOn = false;
+    refreshAudioBtn();
+    return;
+  }
+  // 在使用者手勢中先靜音播放一次，解鎖瀏覽器的自動播放限制
+  alertAudio.volume = 0;
+  alertAudio.play().then(() => {
+    alertAudio.pause();
+    alertAudio.currentTime = 0;
+    soundOn = true;
+    refreshAudioBtn();
+    console.log("[System] Audio enabled.");
+  }).catch(e => {
+    console.warn("音效啟用失敗 (瀏覽器阻擋):", e);
+  });
+}
+
+
+
+
+// [修改] 警示音效函式 (增強版)
+// 警示音：僅在使用者已啟用時才播放 (關閉後不再作響)
+function playAlertSound() {
+  if (!soundOn) return;
+  alertAudio.volume = 1.0;
+  try { alertAudio.currentTime = 0; } catch (e) {}
+  alertAudio.play().catch(e => {
+    console.warn("警示音播放失敗:", e);
+  });
+}
+
+
+
+
+let flashInterval = null;
+const originalTitle = document.title; // 記住原本的標題 (🚀Stock Dashboard)
+
+// [新增] 開始閃爍標題
+function startTabFlashing() {
+  if (flashInterval) return; // 如果已經在閃爍，就不用重複啟動
+
+  let showWarning = true;
+  flashInterval = setInterval(() => {
+    // 在 "原本標題" 與 "警示文字" 之間切換
+    document.title = showWarning ? "⚠️【急拉/急殺警示】" : originalTitle;
+    showWarning = !showWarning;
+  }, 800); // 每 0.8 秒切換一次
+}
+
+
+
+
+// [新增] 停止閃爍標題 (回復原狀)
+function stopTabFlashing() {
+  if (flashInterval) {
+    clearInterval(flashInterval);
+    flashInterval = null;
+    document.title = originalTitle; // 強制還原標題
+  }
+}
+
+
+
+
+async function updateNotify() {
+  try {
+    const res = await fetch('/api/monitor');
+    const data = await res.json();
+    document.getElementById('nt-time').innerText = data.timestamp;
+
+    let tableHtml = "";
+    
+    // [新增] 用來標記是否需要發出警報聲
+    let triggerAlertSound = false;
+    
+    data.rows.forEach(row => {
+      // 數值判斷與格式化
+      let changeValue = parseFloat(row.change.replace('%', ''));
+      let colorClass = "neutral";
+      if (changeValue < 0) colorClass = "down";
+      else if (changeValue > 0) colorClass = "up";
+      
+      // 格式化 change_val (加上 + 號，並保留兩位小數)
+      let changeValStr = (row.change_val > 0 ? "+" : "") + row.change_val.toFixed(2);
+      
+      // delta 顏色與數值格式化
+      let deltaClass = "neutral";
+      if (row.delta > 0) deltaClass = "up";
+      else if (row.delta < 0) deltaClass = "down";
+
+      let deltaValStr = (row.delta_val > 0 ? "+" : "") + row.delta_val.toFixed(2);
+      
+      // 1. 取得 TradingView 連結 (這是原本的)
+      const tvLink = getYahooToTradingViewUrl(row.symbol);
+      
+      // 2. [新增] 取得社群連結
+      const commLink = getCommunityLink(row.symbol);
+      
+      // ============================================================
+      // [新增] 檢查警示訊息關鍵字
+      // ============================================================
+      if (row.alert && (row.alert.includes("急拉") || row.alert.includes("急殺"))) {
+        triggerAlertSound = true;
+      }
+      // ============================================================
+      
+      tableHtml += `
+      <tr>
+        <td class="stock-symbol-hover" data-symbol="${row.symbol}" style="padding: 0; height: 1px;">
+           <a href="${tvLink}" target="_blank" style="display: flex; flex-direction: column; justify-content: center; width: 100%; height: 100%; padding: 8px; text-decoration:none; color:inherit;">
+             <div class="fw-bold">${row.symbol}</div>
+             <div class="small text-muted">${row.name}</div>
+           </a>
+        </td>
+        <td>
+           <div class="fw-bold">${row.price}</div>
+           <div class="${colorClass} small">${row.change} (${changeValStr})</div>
+        </td>
+        <td>
+           <div class="${deltaClass}">${(row.delta * 100).toFixed(2)}%</div>
+           <div class="${deltaClass} small">(${deltaValStr})</div>
+        </td>
+        <td style="padding: 0; height: 1px;">
+           <a href="${commLink}" target="_blank" style="display: flex; align-items: center; width: 100%; height: 100%; padding: 8px; text-decoration:none; color:inherit;">
+             <div style="width: 100%">${row.alert || ""}</div>
+           </a>
+        </td>
+      </tr>`;
+    });
+    document.getElementById('stock-table-body').innerHTML = tableHtml || '<tr><td colspan="4" class="text-center text-muted">無資料</td></tr>';
+
+    // [新增] 如果偵測到關鍵字，播放音效
+    if (triggerAlertSound) {
+      playAlertSound();
+      startTabFlashing();
+    }
+
+    // 新聞部分
+    let newsHtml = "";
+    if (data.news && data.news.length > 0) {
+      data.news.forEach(n => {
+        newsHtml += `
+        <div class="news-item">
+            <span class="news-tag">${n.tag}</span>
+            <small class="text-muted" style="margin-left: 5px; margin-right: 5px;">${n.date}</small>
+            <a href="${n.link}" target="_blank" class="news-link">${n.title}</a>
+        </div>`;
+      });
+    } else {
+      newsHtml = '<div class="text-center p-3 text-muted">暫無新聞</div>';
+    }
+    document.getElementById('news-container').innerHTML = newsHtml;
+
+    // ===== 新增：綁定 hover 事件 =====
+    attachStockHoverEvents();
+
+    // 重新套用搜尋過濾 (list 每次刷新都會重建 innerHTML)
+    applyInboxFilter();
+
+  } catch(e) { console.error("Notify Error:", e); }
+}
+
+
+
+// 新增：Reset 按鈕功能
+async function resetMonitor() {
+  if(!confirm("確定要重新載入設定與重算均線嗎？")) return;
+  
+  // 讓按鈕暫時失效顯示載入中
+  const btn = document.querySelector("button[onclick='resetMonitor()']");
+  const originalText = btn.innerText;
+  btn.innerText = "Processing...";
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/reset');
+    const data = await res.json();
+    alert(data.message);
+    // 成功後立即刷新列表
+    updateNotify();
+  } catch(e) {
+    console.error(e);
+    alert("Reset Failed: " + e);
+  } finally {
+    btn.innerText = originalText;
+    btn.disabled = false;
+  }
+}
+
+
+
+
+// ===== 新增函數：處理股票代碼 hover 事件 =====
+function attachStockHoverEvents() {
+  const stockCells = document.querySelectorAll('.stock-symbol-hover');
+  
+  stockCells.forEach(cell => {
+    cell.addEventListener('mouseenter', handleStockHover);
+    cell.addEventListener('mouseleave', handleStockLeave);
+  });
+}
+
+
+
+
+const CHART_URL_MAP = {
+  // === 台股相關 ===
+  '^TWII': 'https://stock.wearn.com/finance_chart.asp?stockid=IDXWT&timeblock=270&sma1=10&sma2=20&sma3=60&volume=1',
+  '^TWOII': 'https://stock.wearn.com/finance_chart.asp?stockid=IDXOT&timekind=0&timeblock=270&sma1=10&sma2=20&sma3=60&volume=1',
+  'FITX': 'https://stock.wearn.com/finance_chart.asp?stockid=WTX&timekind=0&timeblock=270&sma1=10&sma2=20&sma3=60&volume=1', // 台指期
+
+  // === 美股期貨 (維持原本 Intraday 5分K) ===
+  'ES=F': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@es&tf=i5&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // S&P 500 Futures
+  'NQ=F': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@nq&tf=i5&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // Nasdaq 100 Futures
+  'YM=F': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@ym&tf=i5&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // Dow Jones Futures
+
+  // === 美股現貨指數 (使用日線 tf=d 看趨勢) ===
+  '^GSPC': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=SPY&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // S&P 500 (用 SPY 代表)
+  '^IXIC': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=QQQ&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // Nasdaq (用 QQQ 代表)
+  '^DJI':  'https://charts2-node.finviz.com/chart.ashx?cs=m&t=DIA&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // Dow Jones (用 DIA 代表)
+  '^VIX':  'https://charts2-node.finviz.com/chart.ashx?cs=m&t=VIX&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // 恐慌指數
+
+  // === 匯率 Forex (Finviz 代碼對應) ===
+  'DX-Y.NYB': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=DX&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d',     // 美元指數 (DXY)
+  'EURUSD=X': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=EURUSD&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // 歐元/美元
+  'JPY=X':    'https://charts2-node.finviz.com/chart.ashx?cs=m&t=USDJPY&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // 美元/日幣
+  'GBPUSD=X': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=GBPUSD&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // 英鎊/美元
+
+  // === 原物料 Commodities ===
+  'GC=F': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@GC&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // 黃金期貨
+  'CL=F': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@CL&tf=d&s=linear&pm=0&am=0&ct=candle_stick&tm=d', // 原油期貨
+
+  // === 加密貨幣 ===
+  'BTC-USD': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@btcusd&tf=d&ct=candle_stick&tm=d',
+  'ETH-USD': 'https://charts2-node.finviz.com/chart.ashx?cs=m&t=@ethusd&tf=d&ct=candle_stick&tm=d'
+};
+
+
+
+
+function handleStockHover(event) {
+  const symbol = event.currentTarget.getAttribute('data-symbol');
+  if (!symbol) return;
+
+  // === 1. 取得圖片 URL ===
+  let imageUrl = (typeof CHART_URL_MAP !== 'undefined') ? CHART_URL_MAP[symbol] : null;
+
+  if (!imageUrl) {
+    if (symbol.includes('.TW')) {
+      const stockCode = symbol.split('.')[0];
+      imageUrl = `https://stock.wearn.com/finance_chart.asp?stockid=${stockCode}&timeblock=270&sma1=10&sma2=20&sma3=60&volume=1`;
+    } else {
+      var finvizSymbol = symbol.replace(/\./g, '-'); 
+      imageUrl = `https://charts2.finviz.com/chart.ashx?t=${finvizSymbol}&ta=1&ty=c&p=d&s=l`;
+    }
+  }
+  
+  // === 2. 建立 Popup ===
+  let popup = document.getElementById('stock-chart-popup');
+  if (!popup) {
+    popup = document.createElement('div');
+    popup.id = 'stock-chart-popup';
+    popup.className = 'stock-popup';
+    
+    // 基礎樣式
+    popup.style.background = '#fff';
+    popup.style.padding = '10px';
+    popup.style.border = '1px solid #ccc';
+    popup.style.boxShadow = '0 4px 15px rgba(0,0,0,0.3)'; // 加深一點陰影
+    popup.style.borderRadius = '8px';
+    popup.style.zIndex = '9999';
+    document.body.appendChild(popup);
+  }
+  
+  // === 3. 設定位置與尺寸 (關鍵修改) ===
+  popup.style.display = 'block';
+  popup.style.position = 'fixed';
+  popup.style.left = '5px';
+  popup.style.top = '50%';
+  popup.style.transform = 'translateY(-50%)';
+  
+  // 【關鍵修改】：不鎖死 width，改用 min-width
+  // 這樣一開始有最小寬度，等圖片載入後，寬度會自動被圖片撐開
+  popup.style.width = 'auto'; 
+  popup.style.minWidth = '320px'; 
+  popup.style.maxWidth = '95vw'; // 防止圖片太大超出螢幕
+  
+  // === 4. 建構 HTML ===
+  const sparklineId = 'hover_spark_' + symbol.replace(/[^a-zA-Z0-9]/g, '') + '_' + Date.now();
+
+  popup.innerHTML = `
+    <div style="display: flex; flex-direction: column; align-items: center;">
+      
+      <div style="width: 100%; border-bottom: 1px solid #eee; padding-bottom: 5px; margin-bottom: 5px;">
+        <div id="${sparklineId}_title" style="font-weight: bold; margin-bottom: 5px; font-size: 14px; text-align: left;">${symbol} 即時走勢</div>
+        <div id="${sparklineId}" style="width: 100%; height: 80px; display:flex; align-items:center; justify-content:center; background:#f9f9f9;">
+          <span class="loading" style="font-size:12px; color:#999;">載入即時盤...</span>
+        </div>
+      </div>
+
+      <div id="popup-img-container" style="min-height: 200px; display:flex; align-items:center; justify-content:center;">
+        <div class="loading" style="font-size:12px; color:#666;">載入技術線圖...</div>
+      </div>
+
+    </div>
+  `;
+
+  // === 5. 繪製 SVG ===
+  setTimeout(() => {
+    if (typeof renderSparklineSVG === 'function') {
+        renderSparklineSVG(sparklineId, symbol);
+    }
+  }, 100);
+
+  // === 6. 載入圖片 (撐開寬度) ===
+  const img = new Image();
+  
+  // 圖片樣式：讓它保持原始比例，但不要超過螢幕寬度
+  img.style.display = 'block';
+  img.style.maxWidth = '90vw'; // 限制最大寬度，避免手機版爆版
+  img.style.height = 'auto';
+  
+  img.onload = () => {
+    const imgContainer = popup.querySelector('#popup-img-container');
+    if (imgContainer) {
+      imgContainer.innerHTML = ''; 
+      imgContainer.appendChild(img);
+      // 圖片載入後，popup 寬度會自動變寬
+      // 上方的 SVG 因為設了 width: 100% 也會跟著拉長
+    }
+  };
+  
+  img.onerror = () => {
+    const imgContainer = popup.querySelector('#popup-img-container');
+    if (imgContainer) {
+      imgContainer.innerHTML = '<div style="color: red; padding: 20px;">圖表載入失敗</div>';
+    }
+  };
+  
+  img.src = imageUrl;
+}
+
+
+
+
+function handleStockLeave(event) {
+  const popup = document.getElementById('stock-chart-popup');
+  if (popup) {
+    popup.style.display = 'none';
+    
+    // 移除滑鼠移動監聽
+    if (popup._updatePosition) {
+      event.currentTarget.removeEventListener('mousemove', popup._updatePosition);
+      popup._updatePosition = null;
+    }
+  }
+}
+
+
+
+
+window.addEventListener('resize', () => { if(chartInstance) chartInstance.resize(); });
+
+
+
+
+// [修改] 全域點擊監聽
+document.addEventListener('click', function globalInteract() {
+  // 使用者點擊頁面代表已看到警示 → 停止標題閃爍
+  // (不再自動解鎖音效；音效改由喇叭按鈕全權控制，避免與按鈕互相打架)
+  stopTabFlashing();
+}, { once: false });
+
+
+
+
+document.addEventListener('DOMContentLoaded', () => {
+  
+  // [新增] 裝置偵測邏輯
+  function checkMobileMode() {
+    const userAgent = navigator.userAgent || navigator.vendor || window.opera;
+    
+    // 判斷是否為 Android, iOS (iPhone/iPad/iPod) 或其他行動裝置
+    // 這裡我們把 iPad 也強制歸類為 Mobile Mode，以符合您的需求
+    const isMobile = /android|ipad|iphone|ipod|blackberry|iemobile|opera mini/i.test(userAgent.toLowerCase());
+    
+    // 或者：如果螢幕寬度真的非常小 (例如 < 768px)，也強制切換
+    const isSmallScreen = window.innerWidth < 768;
+
+    if (isMobile || isSmallScreen) {
+      document.body.classList.add('mobile-mode');
+      console.log("[System] Mobile Mode Activated (Reason: Device or Screen Size)");
+    } else {
+      document.body.classList.remove('mobile-mode');
+      console.log("[System] Desktop Mode Activated");
+    }
+  }
+
+  // 初始化時執行一次
+  checkMobileMode();
+  
+  // 當視窗縮放時也重新檢查 (選用，方便電腦測試)
+  window.addEventListener('resize', checkMobileMode);
+
+  // ... (原本的初始化代碼) ...
+  updateHeatmap();
+  updateNotify();
+  heatmapInterval = setInterval(conditionalUpdateHeatmap, 300000);
+  monitorInterval = setInterval(updateNotify, 120000);
+});
 </script>
+
+<div id="stock-chart-popup" class="stock-popup"></div>
 </body>
-</html>'''
+</html>
+"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Entry point
-# ═══════════════════════════════════════════════════════════════════════════
 
+
+#@app.route("/")
+@app.route("/stockdashboard/")
+def stockdashboard():
+  return render_template_string(HTML_TEMPLATE)
+
+
+
+
+@app.route("/twheatmap/api/debug")
+def api_debug_cache():
+  fetch_heatmap_data()
+  return jsonify({
+    "GICS_SECTOR_CACHE_size": len(GICS_SECTOR_CACHE),
+    "GICS_sample": list(GICS_SECTOR_CACHE.items())[:3],
+    "NDX_SUBSECTOR_CACHE_size": len(NDX_SUBSECTOR_CACHE),
+    "NDX_sample": list(NDX_SUBSECTOR_CACHE.items())[:3],
+    "DATA_CACHE_sp500": None if DATA_CACHE.get("sp500") is None else len(DATA_CACHE["sp500"]),
+    "DATA_CACHE_ndx": None if DATA_CACHE.get("ndx") is None else len(DATA_CACHE["ndx"]),
+    "DATA_CACHE_twse": None if DATA_CACHE.get("twse") is None else len(DATA_CACHE["twse"]),
+    "last_update": DATA_CACHE.get("last_update"),
+  })
+
+
+@app.route("/twheatmap/api/data")
+def api_heatmap_data():
+  market = request.args.get("market", "twse")
+  type_filter = request.args.get("type", "INDEX")
+  area_metric = request.args.get("area", "tradeValueWeight")
+  
+  print(f"[DEBUG] API Request - Heatmap: Market={market}, Type={type_filter}") # Trace Request
+  
+  df = get_clean_dataframe(market)
+  data_list = build_heatmap_data(df, type_filter, area_metric)
+  
+  print(f"[DEBUG] Heatmap data returned: {len(data_list)} items") # Trace Response
+  
+  return json.dumps(data_list)
+
+
+
+
+@app.route("/api/monitor")
+def api_monitor():
+  print("[DEBUG] API Request - Monitor Check")
+  result = monitor.run_check()
+  return jsonify(result)
+
+
+
+
+@app.route("/api/sparkline_multi")
+def api_sparkline_multi():
+  import json as _json
+  symbols_str = request.args.get('symbols', '')
+  if not symbols_str:
+    return jsonify({'error': 'No symbols'}), 400
+  symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
+  symbols_json = _json.dumps(symbols)
+  url = f'https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.ApacLibraCharts;type=tick;symbols={symbols_json}'
+  headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://tw.stock.yahoo.com/',
+  }
+  try:
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    return Response(r.content, content_type='application/json')
+  except Exception as e:
+    return jsonify({'error': str(e)}), 502
+
+
+
+
+@app.route("/api/sparkline/<path:symbol>")
+def api_sparkline(symbol):
+  url = f'https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.ApacLibraCharts;type=tick;symbols=["{symbol}"]'
+  headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://tw.stock.yahoo.com/',
+  }
+  try:
+    r = requests.get(url, headers=headers, timeout=5)
+    r.raise_for_status()
+    return Response(r.content, content_type='application/json')
+  except Exception as e:
+    return jsonify({'error': str(e)}), 502
+
+
+
+
+# 新增的 Reset API
+@app.route("/api/reset")
+def api_reset():
+  print("[DEBUG] API Request - Reset Monitor")
+  monitor.initialized = False
+  # 立即重新執行初始化與 MA 計算
+  monitor.init_portfolio()
+  return jsonify({"status": "ok", "message": "Monitor System Reset Complete (JSON Reloaded, MA Recalculated)."})
+
+
+
+
+# Initial S&P500 and Nas-100 sectors
+init_sp500_sectors()
+init_ndx_subsectors() 
+
+
+
+
+################################################################################################################################################################
+################################################################################################################################################################
 if __name__ == '__main__':
-  app.run(debug=True)
+    app.run(debug=True)

@@ -439,11 +439,11 @@ def _critical_points_before(stock_df, stock_df_w, stock_df_m, stock):
   if (k_l2d >= d_l2d) and (k_l1d < d_l1d):    sell.append('日KD死亡交叉')
   if (k_l2w >= d_l2w) and (k_l1w < d_l1w):    sell.append('週KD死亡交叉')
   if (k_l2m >= d_l2m) and (k_l1m < d_l1m):    sell.append('月KD死亡交叉')
-  if (k_l2d >= k_l1w) and (k_l1d < k_l1w):    buy.append('日K小於週K')
-  if (k_l2w >= k_l1m) and (k_l1w < k_l1m):    buy.append('週K小於月K')
-  if (k_l1d > 80) and (k_l2d <= 80):           buy.append('日KD大於80')
-  if (k_l1w > 80) and (k_l2w <= 80):           buy.append('週KD大於80')
-  if (k_l1d > 80) and (k_l1w > 80):            buy.append('日週K大於80')
+  if (k_l2d >= k_l1w) and (k_l1d < k_l1w):    sell.append('日K小於週K')
+  if (k_l2w >= k_l1m) and (k_l1w < k_l1m):    sell.append('週K小於月K')
+  if (k_l1d > 80) and (k_l2d <= 80):           sell.append('日KD大於80')
+  if (k_l1w > 80) and (k_l2w <= 80):           sell.append('週KD大於80')
+  if (k_l1d > 80) and (k_l1w > 80):            sell.append('日週K大於80')
   if (r_l1d > 70) and (r_l2d <= 70):           sell.append('日RSI大於70')
   if (r_l1w > 70) and (r_l2w <= 70):           sell.append('週RSI大於70')
   if (v_l1d > 1.5*v_l2d) and (c_l1d <= o_l1d):         sell.append('量大收黑')
@@ -1343,7 +1343,10 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
     sig_dates_list = dl
     sig_notes     += sig_after
     for note in sig_notes:
-      print(f'  {note}')
+      try:
+        print(f'  {note}')
+      except (UnicodeEncodeError, Exception):
+        pass
   except Exception as e:
     print(f'  WARNING: critical points analysis failed: {e}')
 
@@ -1934,18 +1937,49 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
     .set_global_opts(xaxis_opts=opts.AxisOpts(type_='category'))
   )
   if _regime_df is not None:
+    c_kf_fuchsia = '#e040fb'  # TradingView color.fuchsia
+    c_kf_aqua    = '#00bcd4'  # TradingView color.aqua
+
+    kf_v = _regime_df['KF_Velocity'].values if 'KF_Velocity' in _regime_df.columns else np.zeros(len(dates))
+    kf_pieces = []
+    n_bars = len(dates)
+    i = 0
+    while i < n_bars:
+      is_up = (not np.isnan(kf_v[i])) and (kf_v[i] >= 0.0)
+      start = i
+      while i < n_bars and (((not np.isnan(kf_v[i])) and (kf_v[i] >= 0.0)) == is_up):
+        i += 1
+      end = i
+      kf_pieces.append({
+        'gte': start,
+        'lte': end,
+        'color': c_kf_fuchsia if is_up else c_kf_aqua,
+        'label': 'KF多頭 (v >= 0)' if is_up else 'KF空頭 (v < 0)',
+      })
+
     kf_line = (
       Line()
       .add_xaxis(xaxis_data=dates)
       .add_yaxis('KF', _regime_df['KF_Position'].map(f_str.format).tolist(),
                  is_smooth=False, is_symbol_show=False, is_hover_animation=False,
-                 linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.9, color='#00BFFF'),
+                 linestyle_opts=opts.LineStyleOpts(width=2, opacity=0.9),
                  label_opts=opts.LabelOpts(is_show=False),
-                 itemstyle_opts=opts.ItemStyleOpts(color='#00BFFF'), z=7)
+                 itemstyle_opts=opts.ItemStyleOpts(color=c_kf_fuchsia), z=7)
       .set_global_opts(xaxis_opts=opts.AxisOpts(type_='category'))
     )
     lines_chart = lines_chart.overlap(kf_line)
   overlap_kline_line = kline_chart.overlap(lines_chart)
+
+  if _regime_df is not None and len(kf_pieces) > 0:
+    kf_series_index = next((idx for idx, s in enumerate(overlap_kline_line.options.get("series", [])) if s.get("name") == "KF"), None)
+    if kf_series_index is not None:
+      overlap_kline_line.options["visualMap"] = opts.VisualMapOpts(
+        is_show=False,
+        is_piecewise=True,
+        dimension=0,
+        series_index=kf_series_index,
+        pieces=kf_pieces,
+      )
 
   atr_lines = (
     Line()

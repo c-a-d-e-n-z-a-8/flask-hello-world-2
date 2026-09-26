@@ -594,6 +594,51 @@ def _critical_points_after(stock_df, stock_df_w):
   if talib.CDLMORNINGSTAR(_o, _h, _l, _c).iloc[-1] != 0: notes.append('[K-TYPE]: 買點 晨星')
   if talib.CDLEVENINGSTAR(_o, _h, _l, _c).iloc[-1] != 0: notes.append('[K-TYPE]: 賣點 暮星')
 
+  # ── Kalman Filter 關鍵轉折檢查 (多空轉換 & 趨勢力竭) ─────────────────────────
+  if len(stock_df) >= 3 and today_idx >= 2:
+    if 'KF_Velocity' in stock_df.columns:
+      kf_v = stock_df['KF_Velocity'].values
+    elif 'KF_V' in stock_df.columns:
+      kf_v = stock_df['KF_V'].values
+    else:
+      _, kf_v = regime_kalman_filter(stock_df['Close'].values, R=10.0, Q1=0.01, Q2=0.01)
+
+    v_today = kf_v[today_idx]
+    v_prev  = kf_v[today_idx - 1]
+    v_prev2 = kf_v[today_idx - 2]
+
+    # 1. 多空轉換 (Zero-Crossing)
+    if not (np.isnan(v_today) or np.isnan(v_prev)):
+      if (v_prev < 0.0) and (v_today >= 0.0):
+        notes.append('[KF] 多空轉換 (空轉多)')
+        dates_list.append([today_idx, 'UK'])
+      elif (v_prev >= 0.0) and (v_today < 0.0):
+        notes.append('[KF] 多空轉換 (多轉空)')
+        dates_list.append([today_idx, 'DK'])
+
+    # 2. 趨勢力竭 (ATR 標準化加速度歸零 + 拐點確認)
+    if not (np.isnan(v_today) or np.isnan(v_prev) or np.isnan(v_prev2)):
+      atr_val = stock_df['ATR'].iloc[today_idx] if 'ATR' in stock_df.columns else np.nan
+      if np.isnan(atr_val) or atr_val <= 0.0:
+        atr_val = stock_df['Close'].iloc[today_idx] * 0.02
+      atr_val = max(float(atr_val), 1e-4)
+
+      acc_today = v_today - v_prev
+      acc_prev  = v_prev - v_prev2
+
+      norm_v   = abs(v_today) / atr_val
+      norm_acc = abs(acc_today) / atr_val
+
+      TREND_THRESH  = 0.25
+      ACC_NEAR_ZERO = 0.04
+
+      # 力竭確認：推升/下殺衝力見頂，加速度首度頓挫掉頭 (多方 acc_today <= 0, 空方 acc_today >= 0)
+      if norm_v >= TREND_THRESH and norm_acc <= ACC_NEAR_ZERO:
+        if v_today > 0.0 and acc_prev > 0.0 and acc_today <= 0.0:
+          notes.append('[KF] 趨勢力竭 (多方動能耗盡)')
+        elif v_today < 0.0 and acc_prev < 0.0 and acc_today >= 0.0:
+          notes.append('[KF] 趨勢力竭 (空方動能耗盡)')
+
   return dates_list, notes
 
 
@@ -1683,6 +1728,8 @@ def stock_one_chart(ticker_input, dir='.', display_days=365, finlab_token=''):
     'UP': ('diamond',  6, _c_buy,  0.95, False),  # general buy
     'DP': ('diamond',  6, _c_sell, 1.05, True ),  # general sell
     'BB': ('circle',   5, '#e040fb', 1.00, None),  # BB squeeze
+    'UK': ('roundRect', 6, '#e040fb', 0.95, False), # KF 空轉多 (洋紅)
+    'DK': ('roundRect', 6, '#00e5ff', 1.05, True ),  # KF 多轉空 (青藍)
   }
   for idx_sig, tag in sig_dates_list:
     if idx_sig >= len(dates):
